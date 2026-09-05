@@ -25,7 +25,13 @@ enum class FDCForwardPlan : int {
     DirectN16K3D256 = 3,
     DirectN6K7D256 = 4,
     DirectN6K3D512 = 5,
-    NewGemmNK3D256 = 6
+    NewGemmNK3D256 = 6,
+    N32K3D256 = 7,
+    N16K3D256 = 8,
+    N64K3D256 = 9,
+    N128K3D256 = 10,
+    N256K3D256 = 11,
+    N512K3D256 = 12
 };
 
 static inline const char* fdc_forward_plan_name_impl(FDCForwardPlan p) {
@@ -50,6 +56,24 @@ static inline const char* fdc_forward_plan_name_impl(FDCForwardPlan p) {
 
         case FDCForwardPlan::NewGemmNK3D256:
             return "forward_new_gemm_nk3_d256";
+
+        case FDCForwardPlan::N16K3D256:
+            return "forward_n16_k3_d256";
+
+        case FDCForwardPlan::N32K3D256:
+            return "forward_n32_k3_d256";
+
+        case FDCForwardPlan::N64K3D256:
+            return "forward_n64_k3_d256";
+
+        case FDCForwardPlan::N128K3D256:
+            return "forward_n128_k3_d256";
+
+        case FDCForwardPlan::N256K3D256:
+            return "forward_n256_k3_d256";
+
+        case FDCForwardPlan::N512K3D256:
+            return "forward_n512_k3_d256";
 
         default:
             return "unknown";
@@ -92,22 +116,22 @@ struct FDCForwardCacheKeyHash {
     std::size_t operator()(const FDCForwardCacheKey& k) const {
         std::size_t h = 1469598103934665603ull;
 
-        auto mix = [&](int v) {
+        auto mix_hash = [&](int v) {
             h ^= static_cast<std::size_t>(v);
             h *= 1099511628211ull;
         };
 
-        mix(k.device);
-        mix(k.sm);
-        mix(k.dtype);
-        mix(k.B);
-        mix(k.D);
-        mix(k.L);
-        mix(k.T);
-        mix(k.N);
-        mix(k.K);
-        mix(k.off);
-        mix(k.dilation);
+        mix_hash(k.device);
+        mix_hash(k.sm);
+        mix_hash(k.dtype);
+        mix_hash(k.B);
+        mix_hash(k.D);
+        mix_hash(k.L);
+        mix_hash(k.T);
+        mix_hash(k.N);
+        mix_hash(k.K);
+        mix_hash(k.off);
+        mix_hash(k.dilation);
 
         return h;
     }
@@ -222,6 +246,11 @@ struct FDCForwardShapeInfo {
 
     bool n6k3d256;
     bool n16k3d256;
+    bool n32k3d256;
+    bool n64k3d256;
+    bool n128k3d256;
+    bool n256k3d256;
+    bool n512k3d256;
     bool n6k7d256;
     bool n6k3d512;
     bool smalln_preload;
@@ -266,6 +295,51 @@ static inline FDCForwardShapeInfo make_fdc_forward_shape_info(
         s.N == 16 &&
         s.K == 3 &&
         s.dil1;
+
+    s.n32k3d256 =
+        s.B == 1 &&
+        s.D == 256 &&
+        s.N == 32 &&
+        s.K == 3 &&
+        s.dil1 &&
+        s.is_fp32 &&
+        s.T >= 512;
+
+    s.n64k3d256 =
+        s.B == 1 &&
+        s.D == 256 &&
+        s.N == 64 &&
+        s.K == 3 &&
+        s.dil1 &&
+        s.is_fp32 &&
+        s.T >= 512;
+
+    s.n128k3d256 =
+        s.B == 1 &&
+        s.D == 256 &&
+        s.N == 128 &&
+        s.K == 3 &&
+        s.dil1 &&
+        s.is_fp32 &&
+        s.T >= 512;
+
+    s.n256k3d256 =
+        s.B == 1 &&
+        s.D == 256 &&
+        s.N == 256 &&
+        s.K == 3 &&
+        s.dil1 &&
+        s.is_fp32 &&
+        s.T >= 512;
+
+    s.n512k3d256 =
+        s.B == 1 &&
+        s.D == 256 &&
+        s.N == 512 &&
+        s.K == 3 &&
+        s.dil1 &&
+        s.is_fp32 &&
+        s.T >= 512;
 
     s.n6k7d256 =
         s.B == 1 &&
@@ -333,388 +407,6 @@ static inline void check_fdc_forward_inputs(
 }
 
 // ======================================================================================
-// Kernels: generic 2D
-// ======================================================================================
-
-template <typename scalar_t>
-__global__ void fdc_forward_direct_generic_2d_kernel(
-    const scalar_t* __restrict__ h,
-    const scalar_t* __restrict__ kc,
-    const scalar_t* __restrict__ mix,
-    scalar_t* __restrict__ out,
-    int B,
-    int D,
-    int L,
-    int T,
-    int N,
-    int K,
-    int off,
-    int dilation
-) {
-    int t = blockIdx.x * blockDim.x + threadIdx.x;
-    int d = blockIdx.y * blockDim.y + threadIdx.y;
-    int b = blockIdx.z;
-
-    if (b >= B || d >= D || t >= T) {
-        return;
-    }
-
-    float acc = 0.0f;
-
-    int64_t hbase = ((int64_t)b * D + d) * L;
-    int64_t obase = ((int64_t)b * D + d) * T;
-    int64_t kbase = ((int64_t)b * T + t) * N * K;
-    int64_t mbase = (int64_t)d * N;
-
-    for (int kk = 0; kk < K; ++kk) {
-        int s = off + t - kk * dilation;
-
-        if (s < 0 || s >= L) {
-            continue;
-        }
-
-        float w = 0.0f;
-
-        for (int n = 0; n < N; ++n) {
-            w += fdc_to_float_dev(kc[kbase + n * K + kk]) *
-                 fdc_to_float_dev(mix[mbase + n]);
-        }
-
-        acc += w * fdc_to_float_dev(h[hbase + s]);
-    }
-
-    out[obase + t] = fdc_from_float_dev<scalar_t>(acc);
-}
-
-// ======================================================================================
-// Kernels: generic small-N preload
-// ======================================================================================
-
-template <typename scalar_t, bool NO_BOUNDARY>
-__global__ void fdc_forward_direct_generic_smalln_preload_kernel(
-    const scalar_t* __restrict__ h,
-    const scalar_t* __restrict__ kc,
-    const scalar_t* __restrict__ mix,
-    scalar_t* __restrict__ out,
-    int B,
-    int D,
-    int L,
-    int T,
-    int N,
-    int K,
-    int off,
-    int dilation
-) {
-    int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int64_t total = static_cast<int64_t>(B) * D * T;
-
-    if (idx >= total) {
-        return;
-    }
-
-    int t = static_cast<int>(idx % T);
-    int64_t q = idx / T;
-    int d = static_cast<int>(q % D);
-    int b = static_cast<int>(q / D);
-
-    int64_t hbase = ((int64_t)b * D + d) * L;
-    int64_t obase = ((int64_t)b * D + d) * T;
-    int64_t kbase = ((int64_t)b * T + t) * N * K;
-    int64_t mbase = (int64_t)d * N;
-
-    float m[16];
-
-#pragma unroll
-    for (int i = 0; i < 16; ++i) {
-        m[i] = 0.0f;
-    }
-
-    for (int n = 0; n < N; ++n) {
-        m[n] = fdc_to_float_dev(mix[mbase + n]);
-    }
-
-    float acc = 0.0f;
-
-    for (int kk = 0; kk < K; ++kk) {
-        int s = off + t - kk * dilation;
-
-        if constexpr (!NO_BOUNDARY) {
-            if (s < 0 || s >= L) {
-                continue;
-            }
-        }
-
-        float w = 0.0f;
-
-        for (int n = 0; n < N; ++n) {
-            w += fdc_to_float_dev(kc[kbase + n * K + kk]) * m[n];
-        }
-
-        acc += w * fdc_to_float_dev(h[hbase + s]);
-    }
-
-    out[obase + t] = fdc_from_float_dev<scalar_t>(acc);
-}
-
-// ======================================================================================
-// Kernels: B=1, D=256, N=6, K=3, dilation=1
-// ======================================================================================
-
-template <typename scalar_t, bool NO_BOUNDARY>
-__global__ void fdc_forward_direct_n6k3_d256_kernel(
-    const scalar_t* __restrict__ h,
-    const scalar_t* __restrict__ kc,
-    const scalar_t* __restrict__ mix,
-    scalar_t* __restrict__ out,
-    int L,
-    int T,
-    int off
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = 256 * T;
-
-    if (idx >= total) {
-        return;
-    }
-
-    int t = idx % T;
-    int d = idx / T;
-
-    float m0 = fdc_to_float_dev(mix[d * 6 + 0]);
-    float m1 = fdc_to_float_dev(mix[d * 6 + 1]);
-    float m2 = fdc_to_float_dev(mix[d * 6 + 2]);
-    float m3 = fdc_to_float_dev(mix[d * 6 + 3]);
-    float m4 = fdc_to_float_dev(mix[d * 6 + 4]);
-    float m5 = fdc_to_float_dev(mix[d * 6 + 5]);
-
-    float acc = 0.0f;
-
-#pragma unroll
-    for (int kk = 0; kk < 3; ++kk) {
-        int s = off + t - kk;
-
-        if constexpr (!NO_BOUNDARY) {
-            if (s < 0 || s >= L) {
-                continue;
-            }
-        }
-
-        int64_t kb = (int64_t)t * 18 + kk;
-
-        float w =
-            fdc_to_float_dev(kc[kb + 0 * 3]) * m0 +
-            fdc_to_float_dev(kc[kb + 1 * 3]) * m1 +
-            fdc_to_float_dev(kc[kb + 2 * 3]) * m2 +
-            fdc_to_float_dev(kc[kb + 3 * 3]) * m3 +
-            fdc_to_float_dev(kc[kb + 4 * 3]) * m4 +
-            fdc_to_float_dev(kc[kb + 5 * 3]) * m5;
-
-        acc += w * fdc_to_float_dev(h[(int64_t)d * L + s]);
-    }
-
-    out[(int64_t)d * T + t] = fdc_from_float_dev<scalar_t>(acc);
-}
-
-// ======================================================================================
-// Kernels: B=1, D=512, N=6, K=3, dilation=1
-// ======================================================================================
-
-template <typename scalar_t, bool NO_BOUNDARY>
-__global__ void fdc_forward_direct_n6k3_d512_kernel(
-    const scalar_t* __restrict__ h,
-    const scalar_t* __restrict__ kc,
-    const scalar_t* __restrict__ mix,
-    scalar_t* __restrict__ out,
-    int L,
-    int T,
-    int off
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = 512 * T;
-
-    if (idx >= total) {
-        return;
-    }
-
-    int t = idx % T;
-    int d = idx / T;
-
-    float m0 = fdc_to_float_dev(mix[d * 6 + 0]);
-    float m1 = fdc_to_float_dev(mix[d * 6 + 1]);
-    float m2 = fdc_to_float_dev(mix[d * 6 + 2]);
-    float m3 = fdc_to_float_dev(mix[d * 6 + 3]);
-    float m4 = fdc_to_float_dev(mix[d * 6 + 4]);
-    float m5 = fdc_to_float_dev(mix[d * 6 + 5]);
-
-    float acc = 0.0f;
-
-#pragma unroll
-    for (int kk = 0; kk < 3; ++kk) {
-        int s = off + t - kk;
-
-        if constexpr (!NO_BOUNDARY) {
-            if (s < 0 || s >= L) {
-                continue;
-            }
-        }
-
-        int64_t kb = (int64_t)t * 18 + kk;
-
-        float w =
-            fdc_to_float_dev(kc[kb + 0 * 3]) * m0 +
-            fdc_to_float_dev(kc[kb + 1 * 3]) * m1 +
-            fdc_to_float_dev(kc[kb + 2 * 3]) * m2 +
-            fdc_to_float_dev(kc[kb + 3 * 3]) * m3 +
-            fdc_to_float_dev(kc[kb + 4 * 3]) * m4 +
-            fdc_to_float_dev(kc[kb + 5 * 3]) * m5;
-
-        acc += w * fdc_to_float_dev(h[(int64_t)d * L + s]);
-    }
-
-    out[(int64_t)d * T + t] = fdc_from_float_dev<scalar_t>(acc);
-}
-
-// ======================================================================================
-// Kernels: B=1, D=256, N=16, K=3, dilation=1
-// ======================================================================================
-
-template <typename scalar_t, bool NO_BOUNDARY>
-__global__ void fdc_forward_direct_n16k3_d256_kernel(
-    const scalar_t* __restrict__ h,
-    const scalar_t* __restrict__ kc,
-    const scalar_t* __restrict__ mix,
-    scalar_t* __restrict__ out,
-    int L,
-    int T,
-    int off
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = 256 * T;
-
-    if (idx >= total) {
-        return;
-    }
-
-    int t = idx % T;
-    int d = idx / T;
-
-    int64_t mb = (int64_t)d * 16;
-
-    float m0 = fdc_to_float_dev(mix[mb + 0]);
-    float m1 = fdc_to_float_dev(mix[mb + 1]);
-    float m2 = fdc_to_float_dev(mix[mb + 2]);
-    float m3 = fdc_to_float_dev(mix[mb + 3]);
-    float m4 = fdc_to_float_dev(mix[mb + 4]);
-    float m5 = fdc_to_float_dev(mix[mb + 5]);
-    float m6 = fdc_to_float_dev(mix[mb + 6]);
-    float m7 = fdc_to_float_dev(mix[mb + 7]);
-    float m8 = fdc_to_float_dev(mix[mb + 8]);
-    float m9 = fdc_to_float_dev(mix[mb + 9]);
-    float m10 = fdc_to_float_dev(mix[mb + 10]);
-    float m11 = fdc_to_float_dev(mix[mb + 11]);
-    float m12 = fdc_to_float_dev(mix[mb + 12]);
-    float m13 = fdc_to_float_dev(mix[mb + 13]);
-    float m14 = fdc_to_float_dev(mix[mb + 14]);
-    float m15 = fdc_to_float_dev(mix[mb + 15]);
-
-    float acc = 0.0f;
-
-#pragma unroll
-    for (int kk = 0; kk < 3; ++kk) {
-        int s = off + t - kk;
-
-        if constexpr (!NO_BOUNDARY) {
-            if (s < 0 || s >= L) {
-                continue;
-            }
-        }
-
-        int64_t kb = (int64_t)t * 48 + kk;
-
-        float w =
-            fdc_to_float_dev(kc[kb + 0 * 3]) * m0 +
-            fdc_to_float_dev(kc[kb + 1 * 3]) * m1 +
-            fdc_to_float_dev(kc[kb + 2 * 3]) * m2 +
-            fdc_to_float_dev(kc[kb + 3 * 3]) * m3 +
-            fdc_to_float_dev(kc[kb + 4 * 3]) * m4 +
-            fdc_to_float_dev(kc[kb + 5 * 3]) * m5 +
-            fdc_to_float_dev(kc[kb + 6 * 3]) * m6 +
-            fdc_to_float_dev(kc[kb + 7 * 3]) * m7 +
-            fdc_to_float_dev(kc[kb + 8 * 3]) * m8 +
-            fdc_to_float_dev(kc[kb + 9 * 3]) * m9 +
-            fdc_to_float_dev(kc[kb + 10 * 3]) * m10 +
-            fdc_to_float_dev(kc[kb + 11 * 3]) * m11 +
-            fdc_to_float_dev(kc[kb + 12 * 3]) * m12 +
-            fdc_to_float_dev(kc[kb + 13 * 3]) * m13 +
-            fdc_to_float_dev(kc[kb + 14 * 3]) * m14 +
-            fdc_to_float_dev(kc[kb + 15 * 3]) * m15;
-
-        acc += w * fdc_to_float_dev(h[(int64_t)d * L + s]);
-    }
-
-    out[(int64_t)d * T + t] = fdc_from_float_dev<scalar_t>(acc);
-}
-
-// ======================================================================================
-// Kernels: B=1, D=256, N=6, K=7, dilation=1
-// ======================================================================================
-
-template <typename scalar_t, bool NO_BOUNDARY>
-__global__ void fdc_forward_direct_n6k7_d256_kernel(
-    const scalar_t* __restrict__ h,
-    const scalar_t* __restrict__ kc,
-    const scalar_t* __restrict__ mix,
-    scalar_t* __restrict__ out,
-    int L,
-    int T,
-    int off
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = 256 * T;
-
-    if (idx >= total) {
-        return;
-    }
-
-    int t = idx % T;
-    int d = idx / T;
-
-    float m0 = fdc_to_float_dev(mix[d * 6 + 0]);
-    float m1 = fdc_to_float_dev(mix[d * 6 + 1]);
-    float m2 = fdc_to_float_dev(mix[d * 6 + 2]);
-    float m3 = fdc_to_float_dev(mix[d * 6 + 3]);
-    float m4 = fdc_to_float_dev(mix[d * 6 + 4]);
-    float m5 = fdc_to_float_dev(mix[d * 6 + 5]);
-
-    float acc = 0.0f;
-
-#pragma unroll
-    for (int kk = 0; kk < 7; ++kk) {
-        int s = off + t - kk;
-
-        if constexpr (!NO_BOUNDARY) {
-            if (s < 0 || s >= L) {
-                continue;
-            }
-        }
-
-        int64_t kb = (int64_t)t * 42 + kk;
-
-        float w =
-            fdc_to_float_dev(kc[kb + 0 * 7]) * m0 +
-            fdc_to_float_dev(kc[kb + 1 * 7]) * m1 +
-            fdc_to_float_dev(kc[kb + 2 * 7]) * m2 +
-            fdc_to_float_dev(kc[kb + 3 * 7]) * m3 +
-            fdc_to_float_dev(kc[kb + 4 * 7]) * m4 +
-            fdc_to_float_dev(kc[kb + 5 * 7]) * m5;
-
-        acc += w * fdc_to_float_dev(h[(int64_t)d * L + s]);
-    }
-
-    out[(int64_t)d * T + t] = fdc_from_float_dev<scalar_t>(acc);
-}
-
-// ======================================================================================
 // Plan availability
 // ======================================================================================
 
@@ -747,6 +439,60 @@ static inline bool fdc_forward_plan_available(
         case FDCForwardPlan::DirectN16K3D256:
             return s.n16k3d256;
 
+        case FDCForwardPlan::N16K3D256:
+            return fdc_forward_n16_k3_d256_available_cuda(
+                h,
+                kc,
+                mix,
+                off,
+                dilation
+            );
+
+        case FDCForwardPlan::N32K3D256:
+            return fdc_forward_n32_k3_d256_available_cuda(
+                h,
+                kc,
+                mix,
+                off,
+                dilation
+            );
+
+        case FDCForwardPlan::N64K3D256:
+            return fdc_forward_n64_k3_d256_available_cuda(
+                h,
+                kc,
+                mix,
+                off,
+                dilation
+            );
+
+        case FDCForwardPlan::N128K3D256:
+            return fdc_forward_n128_k3_d256_available_cuda(
+                h,
+                kc,
+                mix,
+                off,
+                dilation
+            );
+
+        case FDCForwardPlan::N256K3D256:
+            return fdc_forward_n256_k3_d256_available_cuda(
+                h,
+                kc,
+                mix,
+                off,
+                dilation
+            );
+
+        case FDCForwardPlan::N512K3D256:
+            return fdc_forward_n512_k3_d256_available_cuda(
+                h,
+                kc,
+                mix,
+                off,
+                dilation
+            );
+
         case FDCForwardPlan::DirectN6K7D256:
             return s.n6k7d256;
 
@@ -768,361 +514,8 @@ static inline bool fdc_forward_plan_available(
 }
 
 // ======================================================================================
-// Plan runners
+// Plan runner
 // ======================================================================================
-
-template <typename scalar_t>
-static torch::Tensor fdc_run_forward_direct_generic_2d_typed(
-    torch::Tensor h,
-    torch::Tensor kc,
-    torch::Tensor mix,
-    int64_t off,
-    int64_t dilation
-) {
-    int B = static_cast<int>(h.size(0));
-    int D = static_cast<int>(h.size(1));
-    int L = static_cast<int>(h.size(2));
-    int T = static_cast<int>(kc.size(1));
-    int N = static_cast<int>(kc.size(2));
-    int K = static_cast<int>(kc.size(3));
-
-    auto out = torch::empty(
-        {B, D, T},
-        h.options()
-    );
-
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-
-    dim3 block(16, 16);
-    dim3 grid(
-        (T + 15) / 16,
-        (D + 15) / 16,
-        B
-    );
-
-    fdc_forward_direct_generic_2d_kernel<scalar_t><<<
-        grid,
-        block,
-        0,
-        stream
-    >>>(
-        h.data_ptr<scalar_t>(),
-        kc.data_ptr<scalar_t>(),
-        mix.data_ptr<scalar_t>(),
-        out.data_ptr<scalar_t>(),
-        B,
-        D,
-        L,
-        T,
-        N,
-        K,
-        static_cast<int>(off),
-        static_cast<int>(dilation)
-    );
-
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-
-    return out;
-}
-
-template <typename scalar_t>
-static torch::Tensor fdc_run_forward_direct_generic_smalln_preload_typed(
-    torch::Tensor h,
-    torch::Tensor kc,
-    torch::Tensor mix,
-    int64_t off,
-    int64_t dilation
-) {
-    int B = static_cast<int>(h.size(0));
-    int D = static_cast<int>(h.size(1));
-    int L = static_cast<int>(h.size(2));
-    int T = static_cast<int>(kc.size(1));
-    int N = static_cast<int>(kc.size(2));
-    int K = static_cast<int>(kc.size(3));
-
-    auto out = torch::empty(
-        {B, D, T},
-        h.options()
-    );
-
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-
-    int64_t total = static_cast<int64_t>(B) * D * T;
-
-    bool no_boundary =
-        static_cast<int>(dilation) == 1 &&
-        static_cast<int>(off) >= K - 1;
-
-    if (no_boundary) {
-        fdc_forward_direct_generic_smalln_preload_kernel<scalar_t, true><<<
-            (total + 255) / 256,
-            256,
-            0,
-            stream
-        >>>(
-            h.data_ptr<scalar_t>(),
-            kc.data_ptr<scalar_t>(),
-            mix.data_ptr<scalar_t>(),
-            out.data_ptr<scalar_t>(),
-            B,
-            D,
-            L,
-            T,
-            N,
-            K,
-            static_cast<int>(off),
-            static_cast<int>(dilation)
-        );
-    } else {
-        fdc_forward_direct_generic_smalln_preload_kernel<scalar_t, false><<<
-            (total + 255) / 256,
-            256,
-            0,
-            stream
-        >>>(
-            h.data_ptr<scalar_t>(),
-            kc.data_ptr<scalar_t>(),
-            mix.data_ptr<scalar_t>(),
-            out.data_ptr<scalar_t>(),
-            B,
-            D,
-            L,
-            T,
-            N,
-            K,
-            static_cast<int>(off),
-            static_cast<int>(dilation)
-        );
-    }
-
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-
-    return out;
-}
-
-template <typename scalar_t>
-static torch::Tensor fdc_run_forward_direct_n6k3_d256_typed(
-    torch::Tensor h,
-    torch::Tensor kc,
-    torch::Tensor mix,
-    int64_t off
-) {
-    int L = static_cast<int>(h.size(2));
-    int T = static_cast<int>(kc.size(1));
-
-    auto out = torch::empty(
-        {1, 256, T},
-        h.options()
-    );
-
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-
-    bool no_boundary = static_cast<int>(off) >= 2;
-
-    if (no_boundary) {
-        fdc_forward_direct_n6k3_d256_kernel<scalar_t, true><<<
-            (256 * T + 255) / 256,
-            256,
-            0,
-            stream
-        >>>(
-            h.data_ptr<scalar_t>(),
-            kc.data_ptr<scalar_t>(),
-            mix.data_ptr<scalar_t>(),
-            out.data_ptr<scalar_t>(),
-            L,
-            T,
-            static_cast<int>(off)
-        );
-    } else {
-        fdc_forward_direct_n6k3_d256_kernel<scalar_t, false><<<
-            (256 * T + 255) / 256,
-            256,
-            0,
-            stream
-        >>>(
-            h.data_ptr<scalar_t>(),
-            kc.data_ptr<scalar_t>(),
-            mix.data_ptr<scalar_t>(),
-            out.data_ptr<scalar_t>(),
-            L,
-            T,
-            static_cast<int>(off)
-        );
-    }
-
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-
-    return out;
-}
-
-template <typename scalar_t>
-static torch::Tensor fdc_run_forward_direct_n6k3_d512_typed(
-    torch::Tensor h,
-    torch::Tensor kc,
-    torch::Tensor mix,
-    int64_t off
-) {
-    int L = static_cast<int>(h.size(2));
-    int T = static_cast<int>(kc.size(1));
-
-    auto out = torch::empty(
-        {1, 512, T},
-        h.options()
-    );
-
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-
-    bool no_boundary = static_cast<int>(off) >= 2;
-
-    if (no_boundary) {
-        fdc_forward_direct_n6k3_d512_kernel<scalar_t, true><<<
-            (512 * T + 255) / 256,
-            256,
-            0,
-            stream
-        >>>(
-            h.data_ptr<scalar_t>(),
-            kc.data_ptr<scalar_t>(),
-            mix.data_ptr<scalar_t>(),
-            out.data_ptr<scalar_t>(),
-            L,
-            T,
-            static_cast<int>(off)
-        );
-    } else {
-        fdc_forward_direct_n6k3_d512_kernel<scalar_t, false><<<
-            (512 * T + 255) / 256,
-            256,
-            0,
-            stream
-        >>>(
-            h.data_ptr<scalar_t>(),
-            kc.data_ptr<scalar_t>(),
-            mix.data_ptr<scalar_t>(),
-            out.data_ptr<scalar_t>(),
-            L,
-            T,
-            static_cast<int>(off)
-        );
-    }
-
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-
-    return out;
-}
-
-template <typename scalar_t>
-static torch::Tensor fdc_run_forward_direct_n16k3_d256_typed(
-    torch::Tensor h,
-    torch::Tensor kc,
-    torch::Tensor mix,
-    int64_t off
-) {
-    int L = static_cast<int>(h.size(2));
-    int T = static_cast<int>(kc.size(1));
-
-    auto out = torch::empty(
-        {1, 256, T},
-        h.options()
-    );
-
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-
-    bool no_boundary = static_cast<int>(off) >= 2;
-
-    if (no_boundary) {
-        fdc_forward_direct_n16k3_d256_kernel<scalar_t, true><<<
-            (256 * T + 255) / 256,
-            256,
-            0,
-            stream
-        >>>(
-            h.data_ptr<scalar_t>(),
-            kc.data_ptr<scalar_t>(),
-            mix.data_ptr<scalar_t>(),
-            out.data_ptr<scalar_t>(),
-            L,
-            T,
-            static_cast<int>(off)
-        );
-    } else {
-        fdc_forward_direct_n16k3_d256_kernel<scalar_t, false><<<
-            (256 * T + 255) / 256,
-            256,
-            0,
-            stream
-        >>>(
-            h.data_ptr<scalar_t>(),
-            kc.data_ptr<scalar_t>(),
-            mix.data_ptr<scalar_t>(),
-            out.data_ptr<scalar_t>(),
-            L,
-            T,
-            static_cast<int>(off)
-        );
-    }
-
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-
-    return out;
-}
-
-template <typename scalar_t>
-static torch::Tensor fdc_run_forward_direct_n6k7_d256_typed(
-    torch::Tensor h,
-    torch::Tensor kc,
-    torch::Tensor mix,
-    int64_t off
-) {
-    int L = static_cast<int>(h.size(2));
-    int T = static_cast<int>(kc.size(1));
-
-    auto out = torch::empty(
-        {1, 256, T},
-        h.options()
-    );
-
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-
-    bool no_boundary = static_cast<int>(off) >= 6;
-
-    if (no_boundary) {
-        fdc_forward_direct_n6k7_d256_kernel<scalar_t, true><<<
-            (256 * T + 255) / 256,
-            256,
-            0,
-            stream
-        >>>(
-            h.data_ptr<scalar_t>(),
-            kc.data_ptr<scalar_t>(),
-            mix.data_ptr<scalar_t>(),
-            out.data_ptr<scalar_t>(),
-            L,
-            T,
-            static_cast<int>(off)
-        );
-    } else {
-        fdc_forward_direct_n6k7_d256_kernel<scalar_t, false><<<
-            (256 * T + 255) / 256,
-            256,
-            0,
-            stream
-        >>>(
-            h.data_ptr<scalar_t>(),
-            kc.data_ptr<scalar_t>(),
-            mix.data_ptr<scalar_t>(),
-            out.data_ptr<scalar_t>(),
-            L,
-            T,
-            static_cast<int>(off)
-        );
-    }
-
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-
-    return out;
-}
 
 static torch::Tensor fdc_run_forward_plan(
     FDCForwardPlan plan,
@@ -1134,27 +527,7 @@ static torch::Tensor fdc_run_forward_plan(
 ) {
     switch (plan) {
         case FDCForwardPlan::DirectGeneric2D:
-            if (h.scalar_type() == at::ScalarType::Float) {
-                return fdc_run_forward_direct_generic_2d_typed<float>(
-                    h,
-                    kc,
-                    mix,
-                    off,
-                    dilation
-                );
-            }
-
-            if (h.scalar_type() == at::ScalarType::Half) {
-                return fdc_run_forward_direct_generic_2d_typed<c10::Half>(
-                    h,
-                    kc,
-                    mix,
-                    off,
-                    dilation
-                );
-            }
-
-            return fdc_run_forward_direct_generic_2d_typed<c10::BFloat16>(
+            return fdc_forward_direct_generic_2d_cuda(
                 h,
                 kc,
                 mix,
@@ -1163,27 +536,7 @@ static torch::Tensor fdc_run_forward_plan(
             );
 
         case FDCForwardPlan::DirectGenericSmallNPreload:
-            if (h.scalar_type() == at::ScalarType::Float) {
-                return fdc_run_forward_direct_generic_smalln_preload_typed<float>(
-                    h,
-                    kc,
-                    mix,
-                    off,
-                    dilation
-                );
-            }
-
-            if (h.scalar_type() == at::ScalarType::Half) {
-                return fdc_run_forward_direct_generic_smalln_preload_typed<c10::Half>(
-                    h,
-                    kc,
-                    mix,
-                    off,
-                    dilation
-                );
-            }
-
-            return fdc_run_forward_direct_generic_smalln_preload_typed<c10::BFloat16>(
+            return fdc_forward_direct_generic_smalln_preload_cuda(
                 h,
                 kc,
                 mix,
@@ -1192,51 +545,7 @@ static torch::Tensor fdc_run_forward_plan(
             );
 
         case FDCForwardPlan::DirectN6K3D256:
-            if (h.scalar_type() == at::ScalarType::Float) {
-                return fdc_run_forward_direct_n6k3_d256_typed<float>(
-                    h,
-                    kc,
-                    mix,
-                    off
-                );
-            }
-
-            if (h.scalar_type() == at::ScalarType::Half) {
-                return fdc_run_forward_direct_n6k3_d256_typed<c10::Half>(
-                    h,
-                    kc,
-                    mix,
-                    off
-                );
-            }
-
-            return fdc_run_forward_direct_n6k3_d256_typed<c10::BFloat16>(
-                h,
-                kc,
-                mix,
-                off
-            );
-
-        case FDCForwardPlan::DirectN6K3D512:
-            if (h.scalar_type() == at::ScalarType::Float) {
-                return fdc_run_forward_direct_n6k3_d512_typed<float>(
-                    h,
-                    kc,
-                    mix,
-                    off
-                );
-            }
-
-            if (h.scalar_type() == at::ScalarType::Half) {
-                return fdc_run_forward_direct_n6k3_d512_typed<c10::Half>(
-                    h,
-                    kc,
-                    mix,
-                    off
-                );
-            }
-
-            return fdc_run_forward_direct_n6k3_d512_typed<c10::BFloat16>(
+            return fdc_forward_direct_n6k3_d256_cuda(
                 h,
                 kc,
                 mix,
@@ -1244,25 +553,55 @@ static torch::Tensor fdc_run_forward_plan(
             );
 
         case FDCForwardPlan::DirectN16K3D256:
-            if (h.scalar_type() == at::ScalarType::Float) {
-                return fdc_run_forward_direct_n16k3_d256_typed<float>(
-                    h,
-                    kc,
-                    mix,
-                    off
-                );
-            }
+            return fdc_forward_direct_n16k3_d256_cuda(
+                h,
+                kc,
+                mix,
+                off
+            );
 
-            if (h.scalar_type() == at::ScalarType::Half) {
-                return fdc_run_forward_direct_n16k3_d256_typed<c10::Half>(
-                    h,
-                    kc,
-                    mix,
-                    off
-                );
-            }
+        case FDCForwardPlan::N16K3D256:
+            return fdc_forward_n16_k3_d256_cuda(
+                h,
+                kc,
+                mix,
+                off
+            );
 
-            return fdc_run_forward_direct_n16k3_d256_typed<c10::BFloat16>(
+        case FDCForwardPlan::N32K3D256:
+            return fdc_forward_n32_k3_d256_cuda(
+                h,
+                kc,
+                mix,
+                off
+            );
+
+        case FDCForwardPlan::N64K3D256:
+            return fdc_forward_n64_k3_d256_cuda(
+                h,
+                kc,
+                mix,
+                off
+            );
+
+        case FDCForwardPlan::N128K3D256:
+            return fdc_forward_n128_k3_d256_cuda(
+                h,
+                kc,
+                mix,
+                off
+            );
+
+        case FDCForwardPlan::N256K3D256:
+            return fdc_forward_n256_k3_d256_cuda(
+                h,
+                kc,
+                mix,
+                off
+            );
+
+        case FDCForwardPlan::N512K3D256:
+            return fdc_forward_n512_k3_d256_cuda(
                 h,
                 kc,
                 mix,
@@ -1270,25 +609,15 @@ static torch::Tensor fdc_run_forward_plan(
             );
 
         case FDCForwardPlan::DirectN6K7D256:
-            if (h.scalar_type() == at::ScalarType::Float) {
-                return fdc_run_forward_direct_n6k7_d256_typed<float>(
-                    h,
-                    kc,
-                    mix,
-                    off
-                );
-            }
+            return fdc_forward_direct_n6k7_d256_cuda(
+                h,
+                kc,
+                mix,
+                off
+            );
 
-            if (h.scalar_type() == at::ScalarType::Half) {
-                return fdc_run_forward_direct_n6k7_d256_typed<c10::Half>(
-                    h,
-                    kc,
-                    mix,
-                    off
-                );
-            }
-
-            return fdc_run_forward_direct_n6k7_d256_typed<c10::BFloat16>(
+        case FDCForwardPlan::DirectN6K3D512:
+            return fdc_forward_direct_n6k3_d512_cuda(
                 h,
                 kc,
                 mix,
@@ -1327,6 +656,66 @@ static FDCForwardPlan fdc_default_forward_plan(
         dilation
     );
 
+    if (s.n16k3d256 && fdc_forward_n16_k3_d256_available_cuda(
+            h,
+            kc,
+            mix,
+            off,
+            dilation
+        )) {
+        return FDCForwardPlan::N16K3D256;
+    }
+
+    if (s.n32k3d256 && fdc_forward_n32_k3_d256_available_cuda(
+            h,
+            kc,
+            mix,
+            off,
+            dilation
+        )) {
+        return FDCForwardPlan::N32K3D256;
+    }
+
+    if (s.n64k3d256 && fdc_forward_n64_k3_d256_available_cuda(
+            h,
+            kc,
+            mix,
+            off,
+            dilation
+        )) {
+        return FDCForwardPlan::N64K3D256;
+    }
+
+    if (s.n128k3d256 && fdc_forward_n128_k3_d256_available_cuda(
+            h,
+            kc,
+            mix,
+            off,
+            dilation
+        )) {
+        return FDCForwardPlan::N128K3D256;
+    }
+
+    if (s.n256k3d256 && fdc_forward_n256_k3_d256_available_cuda(
+            h,
+            kc,
+            mix,
+            off,
+            dilation
+        )) {
+        return FDCForwardPlan::N256K3D256;
+    }
+
+    if (s.n512k3d256 && fdc_forward_n512_k3_d256_available_cuda(
+            h,
+            kc,
+            mix,
+            off,
+            dilation
+        )) {
+        return FDCForwardPlan::N512K3D256;
+    }
+
     if (s.n6k3d256) {
         return FDCForwardPlan::DirectN6K3D256;
     }
@@ -1364,6 +753,13 @@ static std::vector<FDCForwardPlan> fdc_all_candidate_forward_plans(
     std::vector<FDCForwardPlan> plans;
 
     FDCForwardPlan all[] = {
+        FDCForwardPlan::N16K3D256,
+        FDCForwardPlan::N32K3D256,
+        FDCForwardPlan::N64K3D256,
+        FDCForwardPlan::N128K3D256,
+        FDCForwardPlan::N256K3D256,
+        FDCForwardPlan::N512K3D256,
+
         FDCForwardPlan::DirectN6K3D256,
         FDCForwardPlan::DirectN16K3D256,
         FDCForwardPlan::DirectN6K7D256,
@@ -1408,20 +804,9 @@ static float fdc_time_forward_plan_once_ms(
     cudaEvent_t start;
     cudaEvent_t stop;
 
-    TORCH_CHECK(
-        cudaEventCreate(&start) == cudaSuccess,
-        "cudaEventCreate start failed"
-    );
-
-    TORCH_CHECK(
-        cudaEventCreate(&stop) == cudaSuccess,
-        "cudaEventCreate stop failed"
-    );
-
-    TORCH_CHECK(
-        cudaEventRecord(start, stream) == cudaSuccess,
-        "cudaEventRecord start failed"
-    );
+    TORCH_CHECK(cudaEventCreate(&start) == cudaSuccess, "cudaEventCreate start failed");
+    TORCH_CHECK(cudaEventCreate(&stop) == cudaSuccess, "cudaEventCreate stop failed");
+    TORCH_CHECK(cudaEventRecord(start, stream) == cudaSuccess, "cudaEventRecord start failed");
 
     auto out = fdc_run_forward_plan(
         plan,
@@ -1434,22 +819,12 @@ static float fdc_time_forward_plan_once_ms(
 
     (void)out;
 
-    TORCH_CHECK(
-        cudaEventRecord(stop, stream) == cudaSuccess,
-        "cudaEventRecord stop failed"
-    );
-
-    TORCH_CHECK(
-        cudaEventSynchronize(stop) == cudaSuccess,
-        "cudaEventSynchronize stop failed"
-    );
+    TORCH_CHECK(cudaEventRecord(stop, stream) == cudaSuccess, "cudaEventRecord stop failed");
+    TORCH_CHECK(cudaEventSynchronize(stop) == cudaSuccess, "cudaEventSynchronize stop failed");
 
     float ms = 0.0f;
 
-    TORCH_CHECK(
-        cudaEventElapsedTime(&ms, start, stop) == cudaSuccess,
-        "cudaEventElapsedTime failed"
-    );
+    TORCH_CHECK(cudaEventElapsedTime(&ms, start, stop) == cudaSuccess, "cudaEventElapsedTime failed");
 
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
@@ -1484,10 +859,7 @@ static float fdc_time_forward_plan_median_ms(
         (void)out;
     }
 
-    TORCH_CHECK(
-        cudaStreamSynchronize(stream) == cudaSuccess,
-        "cudaStreamSynchronize failed before timing"
-    );
+    TORCH_CHECK(cudaStreamSynchronize(stream) == cudaSuccess, "cudaStreamSynchronize failed before timing");
 
     for (int64_t i = 0; i < repeat; ++i) {
         times.push_back(

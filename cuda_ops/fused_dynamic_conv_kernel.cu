@@ -25,7 +25,15 @@ enum class FDCBackwardPlan : int {
     BaseN16K3 = 3,
     Large = 4,
     FP16GemmExV3 = 5,
-    NewGemmNK3D256 = 6
+    NewGemmNK3D256 = 6,
+    ManyNK3D256 = 7,
+
+    N16K3D256 = 8,
+    N32K3D256 = 9,
+    N64K3D256 = 10,
+    N128K3D256 = 11,
+    N256K3D256 = 12,
+    N512K3D256 = 13
 };
 
 static inline const char* fdc_backward_plan_name_impl(FDCBackwardPlan p) {
@@ -50,6 +58,27 @@ static inline const char* fdc_backward_plan_name_impl(FDCBackwardPlan p) {
 
         case FDCBackwardPlan::NewGemmNK3D256:
             return "backward_new_gemm_nk3_d256";
+
+        case FDCBackwardPlan::ManyNK3D256:
+            return "backward_manyn_k3_d256";
+
+        case FDCBackwardPlan::N16K3D256:
+            return "backward_n16_k3_d256";
+
+        case FDCBackwardPlan::N32K3D256:
+            return "backward_n32_k3_d256";
+
+        case FDCBackwardPlan::N64K3D256:
+            return "backward_n64_k3_d256";
+
+        case FDCBackwardPlan::N128K3D256:
+            return "backward_n128_k3_d256";
+
+        case FDCBackwardPlan::N256K3D256:
+            return "backward_n256_k3_d256";
+
+        case FDCBackwardPlan::N512K3D256:
+            return "backward_n512_k3_d256";
 
         default:
             return "unknown";
@@ -212,9 +241,12 @@ struct FDCShapeInfo {
     bool is_fp16;
     bool is_bf16;
 
+    bool base_k3_dil1;
     bool base_d256_k3_dil1;
     bool shape_n6;
+    bool shape_n6_d512;
     bool shape_n16;
+    bool shape_manyn_k3_d256;
     bool full4096_offset0_n6;
 };
 
@@ -238,19 +270,33 @@ static inline FDCShapeInfo make_fdc_shape_info(
     s.is_fp16 = h.scalar_type() == at::ScalarType::Half;
     s.is_bf16 = h.scalar_type() == at::ScalarType::BFloat16;
 
-    s.base_d256_k3_dil1 =
+    s.base_k3_dil1 =
         s.B == 1 &&
-        s.D == 256 &&
         s.K == 3 &&
         static_cast<int>(dilation) == 1;
+
+    s.base_d256_k3_dil1 =
+        s.base_k3_dil1 &&
+        s.D == 256;
 
     s.shape_n6 =
         s.base_d256_k3_dil1 &&
         s.N == 6;
 
+    s.shape_n6_d512 =
+        s.base_k3_dil1 &&
+        s.D == 512 &&
+        s.N == 6;
+
     s.shape_n16 =
         s.base_d256_k3_dil1 &&
         s.N == 16;
+
+    s.shape_manyn_k3_d256 =
+        s.base_d256_k3_dil1 &&
+        s.N >= 16 &&
+        s.N <= 128 &&
+        s.T >= 2048;
 
     s.full4096_offset0_n6 =
         s.shape_n6 &&
@@ -335,6 +381,7 @@ static inline void check_fdc_backward_inputs(
 
 static inline bool fdc_plan_available(
     FDCBackwardPlan plan,
+    torch::Tensor go,
     torch::Tensor h,
     torch::Tensor kc,
     torch::Tensor mix,
@@ -353,13 +400,17 @@ static inline bool fdc_plan_available(
             return s.shape_n6;
 
         case FDCBackwardPlan::MidN6K3Warp:
-            return s.shape_n6;
+            return s.shape_n6 || s.shape_n6_d512;
 
         case FDCBackwardPlan::BaseN6K3:
             return s.shape_n6;
 
         case FDCBackwardPlan::BaseN16K3:
             return s.shape_n16;
+
+        case FDCBackwardPlan::ManyNK3D256:
+            return s.shape_manyn_k3_d256 &&
+                   (s.is_fp32 || s.is_fp16 || s.is_bf16);
 
         case FDCBackwardPlan::Large:
             return s.is_fp32 || s.is_fp16 || s.is_bf16;
@@ -369,6 +420,66 @@ static inline bool fdc_plan_available(
 
         case FDCBackwardPlan::NewGemmNK3D256:
             return fdc_new_gemm_nk3_d256_available_cuda(
+                h,
+                kc,
+                mix,
+                off,
+                dilation
+            );
+
+        case FDCBackwardPlan::N16K3D256:
+            return fdc_backward_n16_k3_d256_available_cuda(
+                go,
+                h,
+                kc,
+                mix,
+                off,
+                dilation
+            );
+
+        case FDCBackwardPlan::N32K3D256:
+            return fdc_backward_n32_k3_d256_available_cuda(
+                go,
+                h,
+                kc,
+                mix,
+                off,
+                dilation
+            );
+
+        case FDCBackwardPlan::N64K3D256:
+            return fdc_backward_n64_k3_d256_available_cuda(
+                go,
+                h,
+                kc,
+                mix,
+                off,
+                dilation
+            );
+
+        case FDCBackwardPlan::N128K3D256:
+            return fdc_backward_n128_k3_d256_available_cuda(
+                go,
+                h,
+                kc,
+                mix,
+                off,
+                dilation
+            );
+
+        case FDCBackwardPlan::N256K3D256:
+            return fdc_backward_n256_k3_d256_available_cuda(
+                go,
+                h,
+                kc,
+                mix,
+                off,
+                dilation
+            );
+
+        case FDCBackwardPlan::N512K3D256:
+            return fdc_backward_n512_k3_d256_available_cuda(
+                go,
                 h,
                 kc,
                 mix,
@@ -440,6 +551,15 @@ static std::vector<torch::Tensor> fdc_run_backward_plan(
                 off
             );
 
+        case FDCBackwardPlan::ManyNK3D256:
+            return fdc_backward_manyn_k3_d256_cuda(
+                go,
+                h,
+                kc,
+                mix,
+                off
+            );
+
         case FDCBackwardPlan::Large:
             return fdc_backward_large_cuda(
                 go,
@@ -469,6 +589,60 @@ static std::vector<torch::Tensor> fdc_run_backward_plan(
                 off
             );
 
+        case FDCBackwardPlan::N16K3D256:
+            return fdc_backward_n16_k3_d256_cuda(
+                go,
+                h,
+                kc,
+                mix,
+                off
+            );
+
+        case FDCBackwardPlan::N32K3D256:
+            return fdc_backward_n32_k3_d256_cuda(
+                go,
+                h,
+                kc,
+                mix,
+                off
+            );
+
+        case FDCBackwardPlan::N64K3D256:
+            return fdc_backward_n64_k3_d256_cuda(
+                go,
+                h,
+                kc,
+                mix,
+                off
+            );
+
+        case FDCBackwardPlan::N128K3D256:
+            return fdc_backward_n128_k3_d256_cuda(
+                go,
+                h,
+                kc,
+                mix,
+                off
+            );
+
+        case FDCBackwardPlan::N256K3D256:
+            return fdc_backward_n256_k3_d256_cuda(
+                go,
+                h,
+                kc,
+                mix,
+                off
+            );
+
+        case FDCBackwardPlan::N512K3D256:
+            return fdc_backward_n512_k3_d256_cuda(
+                go,
+                h,
+                kc,
+                mix,
+                off
+            );
+
         default:
             TORCH_CHECK(false, "unknown fused dynamic conv backward plan");
     }
@@ -491,6 +665,14 @@ static FDCBackwardPlan fdc_default_backward_plan(
         off,
         dilation
     );
+
+    if (s.shape_n6_d512) {
+        return FDCBackwardPlan::MidN6K3Warp;
+    }
+
+    if (s.shape_manyn_k3_d256) {
+        return FDCBackwardPlan::ManyNK3D256;
+    }
 
     if (fdc_new_gemm_nk3_d256_available_cuda(
             h,
@@ -552,6 +734,7 @@ static FDCBackwardPlan fdc_default_backward_plan(
 // ======================================================================================
 
 static std::vector<FDCBackwardPlan> fdc_all_candidate_backward_plans(
+    torch::Tensor go,
     torch::Tensor h,
     torch::Tensor kc,
     torch::Tensor mix,
@@ -561,7 +744,15 @@ static std::vector<FDCBackwardPlan> fdc_all_candidate_backward_plans(
     std::vector<FDCBackwardPlan> plans;
 
     FDCBackwardPlan all[] = {
+        FDCBackwardPlan::N16K3D256,
+        FDCBackwardPlan::N32K3D256,
+        FDCBackwardPlan::N64K3D256,
+        FDCBackwardPlan::N128K3D256,
+        FDCBackwardPlan::N256K3D256,
+        FDCBackwardPlan::N512K3D256,
+
         FDCBackwardPlan::NewGemmNK3D256,
+        FDCBackwardPlan::ManyNK3D256,
         FDCBackwardPlan::SmallN6K3,
         FDCBackwardPlan::MidN6K3Warp,
         FDCBackwardPlan::BaseN6K3,
@@ -573,6 +764,7 @@ static std::vector<FDCBackwardPlan> fdc_all_candidate_backward_plans(
     for (FDCBackwardPlan p : all) {
         if (fdc_plan_available(
                 p,
+                go,
                 h,
                 kc,
                 mix,
@@ -606,20 +798,9 @@ static float fdc_time_backward_plan_once_ms(
     cudaEvent_t start;
     cudaEvent_t stop;
 
-    TORCH_CHECK(
-        cudaEventCreate(&start) == cudaSuccess,
-        "cudaEventCreate start failed"
-    );
-
-    TORCH_CHECK(
-        cudaEventCreate(&stop) == cudaSuccess,
-        "cudaEventCreate stop failed"
-    );
-
-    TORCH_CHECK(
-        cudaEventRecord(start, stream) == cudaSuccess,
-        "cudaEventRecord start failed"
-    );
+    TORCH_CHECK(cudaEventCreate(&start) == cudaSuccess, "cudaEventCreate start failed");
+    TORCH_CHECK(cudaEventCreate(&stop) == cudaSuccess, "cudaEventCreate stop failed");
+    TORCH_CHECK(cudaEventRecord(start, stream) == cudaSuccess, "cudaEventRecord start failed");
 
     auto outs = fdc_run_backward_plan(
         plan,
@@ -633,22 +814,12 @@ static float fdc_time_backward_plan_once_ms(
 
     (void)outs;
 
-    TORCH_CHECK(
-        cudaEventRecord(stop, stream) == cudaSuccess,
-        "cudaEventRecord stop failed"
-    );
-
-    TORCH_CHECK(
-        cudaEventSynchronize(stop) == cudaSuccess,
-        "cudaEventSynchronize stop failed"
-    );
+    TORCH_CHECK(cudaEventRecord(stop, stream) == cudaSuccess, "cudaEventRecord stop failed");
+    TORCH_CHECK(cudaEventSynchronize(stop) == cudaSuccess, "cudaEventSynchronize stop failed");
 
     float ms = 0.0f;
 
-    TORCH_CHECK(
-        cudaEventElapsedTime(&ms, start, stop) == cudaSuccess,
-        "cudaEventElapsedTime failed"
-    );
+    TORCH_CHECK(cudaEventElapsedTime(&ms, start, stop) == cudaSuccess, "cudaEventElapsedTime failed");
 
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
@@ -685,10 +856,7 @@ static float fdc_time_backward_plan_median_ms(
         (void)outs;
     }
 
-    TORCH_CHECK(
-        cudaStreamSynchronize(stream) == cudaSuccess,
-        "cudaStreamSynchronize failed before timing"
-    );
+    TORCH_CHECK(cudaStreamSynchronize(stream) == cudaSuccess, "cudaStreamSynchronize failed before timing");
 
     for (int64_t i = 0; i < repeat; ++i) {
         times.push_back(
@@ -770,6 +938,24 @@ std::vector<torch::Tensor> fused_dynamic_conv_backward_chunk_cuda(
             key,
             &plan
         )) {
+        if (!fdc_plan_available(
+                plan,
+                go,
+                h,
+                kc,
+                mix,
+                off,
+                dilation
+            )) {
+            plan = fdc_default_backward_plan(
+                h,
+                kc,
+                mix,
+                off,
+                dilation
+            );
+        }
+
         FDC_DEBUG_PATH(fdc_backward_plan_name_impl(plan));
 
         return fdc_run_backward_plan(
@@ -832,6 +1018,7 @@ int64_t fused_dynamic_conv_backward_chunk_warmup_cuda(
     );
 
     auto plans = fdc_all_candidate_backward_plans(
+        go,
         h,
         kc,
         mix,
