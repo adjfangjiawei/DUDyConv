@@ -108,7 +108,7 @@ __global__ void fdc_large_make_base_kernel_float_kernel(
 
         kbtn[(static_cast<int64_t>(b) * T + t) * N + n] =
             fdc_to_float_dev(
-                kc[(static_cast<int64_t>(b) * T + t) * N * K + n * K + kk]
+                kc[((static_cast<int64_t>(b) * K + kk) * N + n) * T + t]
             );
     }
 }
@@ -134,7 +134,7 @@ __global__ void fdc_large_copy_gk_kernel(
     int t = q % T;
     int b = q / T;
 
-    dst[(static_cast<int64_t>(b) * T + t) * N * K + n * K + kk] = src[i];
+    dst[((static_cast<int64_t>(b) * K + kk) * N + n) * T + t] = src[i];
 }
 
 // ======================================================================================
@@ -177,13 +177,13 @@ __global__ void fdc_large_grad_h_gather_kernel(
             continue;
         }
 
-        int64_t kbase = (static_cast<int64_t>(b) * T + t) * N * K;
-
         float w = 0.0f;
 
         for (int n = 0; n < N; ++n) {
             w +=
-                fdc_to_float_dev(kc[kbase + n * K + kk]) *
+                fdc_to_float_dev(
+                    kc[((static_cast<int64_t>(b) * K + kk) * N + n) * T + t]
+                ) *
                 fdc_to_float_dev(mix[mbase + n]);
         }
 
@@ -237,12 +237,13 @@ __global__ void fdc_large_grad_h_atomic_kernel(
 
         float w = 0.0f;
 
-        int64_t kb = (static_cast<int64_t>(b) * T + t) * N * K;
         int64_t mb = static_cast<int64_t>(d) * N;
 
         for (int n = 0; n < N; ++n) {
             w +=
-                fdc_to_float_dev(kc[kb + n * K + kk]) *
+                fdc_to_float_dev(
+                    kc[((static_cast<int64_t>(b) * K + kk) * N + n) * T + t]
+                ) *
                 fdc_to_float_dev(mix[mb + n]);
         }
 
@@ -306,14 +307,14 @@ std::vector<torch::Tensor> fdc_backward_large_cuda(
     int64_t off,
     int64_t dilation
 ) {
-    FDC_DEBUG_PATH("FDC path: backward_large");
+    FDC_DEBUG_PATH("FDC path: backward_large_bknt");
 
     int B = static_cast<int>(h.size(0));
     int D = static_cast<int>(h.size(1));
     int L = static_cast<int>(h.size(2));
-    int T = static_cast<int>(kc.size(1));
+    int K = static_cast<int>(kc.size(1));
     int N = static_cast<int>(kc.size(2));
-    int K = static_cast<int>(kc.size(3));
+    int T = static_cast<int>(kc.size(3));
 
     cudaDeviceProp prop;
     cudaError_t prop_err = cudaGetDeviceProperties(&prop, h.get_device());

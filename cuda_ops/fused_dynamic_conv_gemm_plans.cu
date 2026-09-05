@@ -4,131 +4,160 @@
 
 #include <cuda.h>
 #include <cuda_runtime.h>
-#include <cuda_fp16.h>
-#include <cuda_bf16.h>
 #include <cublas_v2.h>
 
 #include <vector>
-#include <type_traits>
 
 #include "fused_dynamic_conv_common.cuh"
 #include "fused_dynamic_conv_plans.h"
 
 // ======================================================================================
-// Local helpers
+// New GEMM NK3 D256 plan
+//
+// Supported shape:
+//
+//   B = 1
+//   D = 256
+//   K = 3
+//   dtype = float32
+//   dilation = 1
+//   N >= 8
+//
+// Layout:
+//
+//   h:
+//     [1,256,L]
+//
+//   kc:
+//     [1,3,N,T]
+//
+//   mix:
+//     [256,N]
+//
+//   out:
+//     [1,256,T]
+//
+// Contiguous kc offset:
+//
+//   kc[0,kk,n,t] = (kk * N + n) * T + t
+//
 // ======================================================================================
 
-template <typename scalar_t>
-__global__ void fdc_new_cast_float_to_scalar_kernel(
-    const float* __restrict__ src,
-    scalar_t* __restrict__ dst,
-    int64_t n
-) {
-    int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+namespace {
 
-    if (i < n) {
-        dst[i] = fdc_from_float_dev<scalar_t>(src[i]);
-    }
+constexpr int FDC_NEW_D = 256;
+constexpr int FDC_NEW_K = 3;
+
+// ======================================================================================
+// cuBLAS check
+// ======================================================================================
+
+static inline void fdc_new_check_cublas_status(
+    cublasStatus_t status,
+    const char* msg
+) {
+    TORCH_CHECK(
+        status == CUBLAS_STATUS_SUCCESS,
+        msg,
+        " cublasStatus=",
+        static_cast<int>(status)
+    );
 }
 
-template <typename scalar_t>
-__global__ void fdc_new_make_mix_t_float_kernel(
-    const scalar_t* __restrict__ mix,
-    float* __restrict__ mix_t,
-    int D,
-    int N
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = D * N;
+// ======================================================================================
+// shape check
+// ======================================================================================
 
-    if (idx >= total) {
-        return;
+static inline bool fdc_new_shape_ok(
+    torch::Tensor h,
+    torch::Tensor kc,
+    torch::Tensor mix,
+    int64_t off,
+    int64_t dilation
+) {
+    if (!h.defined() || !kc.defined() || !mix.defined()) {
+        return false;
     }
 
-    int n = idx % N;
-    int d = idx / N;
-
-    // mix:   [D, N]
-    // mix_t: [N, D]
-    mix_t[n * D + d] = fdc_to_float_dev(mix[d * N + n]);
-}
-
-template <typename scalar_t>
-__global__ void fdc_new_make_kc_ktn_float_kernel(
-    const scalar_t* __restrict__ kc,
-    float* __restrict__ kc_ktn,
-    int T,
-    int N,
-    int K
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = K * T * N;
-
-    if (idx >= total) {
-        return;
+    if (!h.is_cuda() || !kc.is_cuda() || !mix.is_cuda()) {
+        return false;
     }
 
-    int n = idx % N;
-    int q = idx / N;
-    int t = q % T;
-    int kk = q / T;
+    if (!h.is_contiguous() || !kc.is_contiguous() || !mix.is_contiguous()) {
+        return false;
+    }
 
-    // kc:     [B=1, T, N, K]
-    // kc_ktn: [K, T, N]
-    kc_ktn[(static_cast<int64_t>(kk) * T + t) * N + n] =
-        fdc_to_float_dev(kc[(static_cast<int64_t>(t) * N + n) * K + kk]);
+    if (h.dim() != 3 || kc.dim() != 4 || mix.dim() != 2) {
+        return false;
+    }
+
+    if (h.scalar_type() != at::ScalarType::Float ||
+        kc.scalar_type() != at::ScalarType::Float ||
+        mix.scalar_type() != at::ScalarType::Float) {
+        return false;
+    }
+
+    if (h.size(0) != 1 || kc.size(0) != 1) {
+        return false;
+    }
+
+    if (h.size(1) != FDC_NEW_D) {
+        return false;
+    }
+
+    if (kc.size(1) != FDC_NEW_K) {
+        return false;
+    }
+
+    if (kc.size(2) < 8) {
+        return false;
+    }
+
+    if (mix.size(0) != FDC_NEW_D) {
+        return false;
+    }
+
+    if (mix.size(1) != kc.size(2)) {
+        return false;
+    }
+
+    if (dilation != 1) {
+        return false;
+    }
+
+    if (off < 0) {
+        return false;
+    }
+
+    if (off + kc.size(3) > h.size(2)) {
+        return false;
+    }
+
+    return true;
 }
 
-template <typename scalar_t>
-__global__ void fdc_new_make_base_ktd_float_kernel(
-    const scalar_t* __restrict__ go,
-    const scalar_t* __restrict__ h,
-    float* __restrict__ base,
-    int D,
+// ======================================================================================
+// forward combine
+//
+// tmp:
+//   [3,256,T]
+//
+// out[d,t] =
+//   tmp[0,d,t] * h[d,off+t]
+// + tmp[1,d,t] * h[d,off+t-1]
+// + tmp[2,d,t] * h[d,off+t-2]
+// ======================================================================================
+
+__global__ void fdc_new_forward_combine_noboundary_kernel(
+    const float* __restrict__ h,
+    const float* __restrict__ tmp,
+    float* __restrict__ out,
     int L,
     int T,
-    int K,
-    int off
-) {
-    int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int64_t total = static_cast<int64_t>(K) * T * D;
-
-    if (idx >= total) {
-        return;
-    }
-
-    int d = idx % D;
-    int64_t q = idx / D;
-    int t = q % T;
-    int kk = q / T;
-
-    int s = off + t - kk;
-
-    float v = 0.0f;
-
-    if (s >= 0 && s < L) {
-        v =
-            fdc_to_float_dev(go[static_cast<int64_t>(d) * T + t]) *
-            fdc_to_float_dev(h[static_cast<int64_t>(d) * L + s]);
-    }
-
-    // base: [K, T, D], row-major, each kk matrix is [T, D]
-    base[(static_cast<int64_t>(kk) * T + t) * D + d] = v;
-}
-
-template <typename scalar_t>
-__global__ void fdc_new_forward_from_weight_kernel(
-    const scalar_t* __restrict__ h,
-    const float* __restrict__ weight,
-    scalar_t* __restrict__ out,
-    int D,
-    int L,
-    int T,
-    int K,
     int off
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = D * T;
+    int total = FDC_NEW_D * T;
 
     if (idx >= total) {
         return;
@@ -137,639 +166,274 @@ __global__ void fdc_new_forward_from_weight_kernel(
     int t = idx % T;
     int d = idx / T;
 
-    float acc = 0.0f;
+    int64_t ht = static_cast<int64_t>(d) * L + off + t;
+    int64_t ot = static_cast<int64_t>(d) * T + t;
 
-    for (int kk = 0; kk < K; ++kk) {
-        int s = off + t - kk;
+    int64_t tmp0 = static_cast<int64_t>(0) * FDC_NEW_D * T + ot;
+    int64_t tmp1 = static_cast<int64_t>(1) * FDC_NEW_D * T + ot;
+    int64_t tmp2 = static_cast<int64_t>(2) * FDC_NEW_D * T + ot;
 
-        if (s >= 0 && s < L) {
-            acc +=
-                weight[(static_cast<int64_t>(kk) * T + t) * D + d] *
-                fdc_to_float_dev(h[static_cast<int64_t>(d) * L + s]);
-        }
-    }
-
-    out[static_cast<int64_t>(d) * T + t] =
-        fdc_from_float_dev<scalar_t>(acc);
+    out[ot] =
+        tmp[tmp0] * h[ht] +
+        tmp[tmp1] * h[ht - 1] +
+        tmp[tmp2] * h[ht - 2];
 }
 
-template <typename scalar_t>
-__global__ void fdc_new_grad_h_from_weight_kernel(
-    const scalar_t* __restrict__ go,
-    const float* __restrict__ weight,
-    float* __restrict__ gh,
-    int D,
+__global__ void fdc_new_forward_combine_boundary_kernel(
+    const float* __restrict__ h,
+    const float* __restrict__ tmp,
+    float* __restrict__ out,
     int L,
     int T,
-    int K,
     int off
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = D * L;
+    int total = FDC_NEW_D * T;
 
     if (idx >= total) {
         return;
     }
 
-    int s = idx % L;
-    int d = idx / L;
+    int t = idx % T;
+    int d = idx / T;
 
-    int tb = s - off;
+    int s0 = off + t;
+    int s1 = off + t - 1;
+    int s2 = off + t - 2;
 
+    int64_t ot = static_cast<int64_t>(d) * T + t;
     float acc = 0.0f;
 
-    for (int kk = 0; kk < K; ++kk) {
-        int t = tb + kk;
-
-        if (t >= 0 && t < T) {
-            acc +=
-                fdc_to_float_dev(go[static_cast<int64_t>(d) * T + t]) *
-                weight[(static_cast<int64_t>(kk) * T + t) * D + d];
-        }
+    if (s0 >= 0 && s0 < L) {
+        acc += tmp[static_cast<int64_t>(0) * FDC_NEW_D * T + ot] *
+               h[static_cast<int64_t>(d) * L + s0];
     }
 
-    gh[static_cast<int64_t>(d) * L + s] = acc;
+    if (s1 >= 0 && s1 < L) {
+        acc += tmp[static_cast<int64_t>(1) * FDC_NEW_D * T + ot] *
+               h[static_cast<int64_t>(d) * L + s1];
+    }
+
+    if (s2 >= 0 && s2 < L) {
+        acc += tmp[static_cast<int64_t>(2) * FDC_NEW_D * T + ot] *
+               h[static_cast<int64_t>(d) * L + s2];
+    }
+
+    out[ot] = acc;
 }
 
-template <typename scalar_t>
-__global__ void fdc_new_scatter_gk_ktn_to_btnk_kernel(
-    const float* __restrict__ src,
-    scalar_t* __restrict__ dst,
+// ======================================================================================
+// backward helpers
+// ======================================================================================
+
+__global__ void fdc_new_zero_float_kernel(
+    float* __restrict__ ptr,
+    int64_t n
+) {
+    int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+
+    if (i < n) {
+        ptr[i] = 0.0f;
+    }
+}
+
+// ======================================================================================
+// build x for each kk:
+//
+// x[d,t] = go[d,t] * h[d,off+t-kk]
+//
+// x_dt:
+//   [256,T]
+//
+// x_td:
+//   [T,256]
+// ======================================================================================
+
+__global__ void fdc_new_backward_build_x_kernel(
+    const float* __restrict__ go,
+    const float* __restrict__ h,
+    float* __restrict__ x_dt,
+    float* __restrict__ x_td,
+    int L,
+    int T,
+    int off,
+    int kk
+) {
+    int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    int64_t total = static_cast<int64_t>(FDC_NEW_D) * T;
+
+    if (idx >= total) {
+        return;
+    }
+
+    int t = idx % T;
+    int d = idx / T;
+
+    int s = off + t - kk;
+
+    float v = 0.0f;
+
+    if (s >= 0 && s < L) {
+        v =
+            go[static_cast<int64_t>(d) * T + t] *
+            h[static_cast<int64_t>(d) * L + s];
+    }
+
+    x_dt[static_cast<int64_t>(d) * T + t] = v;
+    x_td[static_cast<int64_t>(t) * FDC_NEW_D + d] = v;
+}
+
+// ======================================================================================
+// build kc_tn / kc_nt for each kk:
+//
+// kc_tn:
+//   [T,N]
+//
+// kc_nt:
+//   [N,T]
+//
+// source:
+//
+//   kc[0,kk,n,t]
+// ======================================================================================
+
+__global__ void fdc_new_backward_build_kc_kernel(
+    const float* __restrict__ kc,
+    float* __restrict__ kc_tn,
+    float* __restrict__ kc_nt,
     int T,
     int N,
-    int K
+    int kk
 ) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = T * N * K;
+    int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    int64_t total = static_cast<int64_t>(T) * N;
 
     if (idx >= total) {
         return;
     }
 
-    int kk = idx % K;
-    int q = idx / K;
-    int n = q % N;
-    int t = q / N;
+    int n = idx % N;
+    int t = idx / N;
 
-    float v = src[(static_cast<int64_t>(kk) * T + t) * N + n];
+    float v = kc[(static_cast<int64_t>(kk) * N + n) * T + t];
 
-    dst[(static_cast<int64_t>(t) * N + n) * K + kk] =
-        fdc_from_float_dev<scalar_t>(v);
+    kc_tn[static_cast<int64_t>(t) * N + n] = v;
+    kc_nt[static_cast<int64_t>(n) * T + t] = v;
 }
 
-template <typename scalar_t>
-__global__ void fdc_new_scatter_gm_float_to_scalar_kernel(
-    const float* __restrict__ src,
-    scalar_t* __restrict__ dst,
-    int D,
-    int N
+// ======================================================================================
+// write gk from gk_tn:
+//
+// gk_tn:
+//   [T,N]
+//
+// gk:
+//   [1,3,N,T]
+// ======================================================================================
+
+__global__ void fdc_new_backward_write_gk_kernel(
+    const float* __restrict__ gk_tn,
+    float* __restrict__ gk,
+    int T,
+    int N,
+    int kk
 ) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = D * N;
+    int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    int64_t total = static_cast<int64_t>(T) * N;
 
     if (idx >= total) {
         return;
     }
 
-    dst[idx] = fdc_from_float_dev<scalar_t>(src[idx]);
+    int n = idx % N;
+    int t = idx / N;
+
+    gk[(static_cast<int64_t>(kk) * N + n) * T + t] =
+        gk_tn[static_cast<int64_t>(t) * N + n];
 }
 
 // ======================================================================================
-// Forward GEMM materialized plan
+// accumulate grad_h:
+//
+// w:
+//   [256,T]
+//
+// gh[d,off+t-kk] += go[d,t] * w[d,t]
 // ======================================================================================
 
-template <typename scalar_t>
-static torch::Tensor fdc_new_forward_gemm_nk3_d256_typed(
-    torch::Tensor h,
-    torch::Tensor kc,
-    torch::Tensor mix,
-    int64_t off
+__global__ void fdc_new_backward_accum_gh_kernel(
+    const float* __restrict__ go,
+    const float* __restrict__ w,
+    float* __restrict__ gh,
+    int L,
+    int T,
+    int off,
+    int kk
 ) {
-    int B = static_cast<int>(h.size(0));
-    int D = static_cast<int>(h.size(1));
-    int L = static_cast<int>(h.size(2));
-    int T = static_cast<int>(kc.size(1));
-    int N = static_cast<int>(kc.size(2));
-    int K = static_cast<int>(kc.size(3));
+    int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    int64_t total = static_cast<int64_t>(FDC_NEW_D) * T;
 
-    TORCH_CHECK(B == 1, "fdc_new_forward_gemm_nk3_d256 requires B == 1.");
-    TORCH_CHECK(D == 256, "fdc_new_forward_gemm_nk3_d256 requires D == 256.");
-    TORCH_CHECK(K == 3, "fdc_new_forward_gemm_nk3_d256 requires K == 3.");
-    TORCH_CHECK(N == 6 || N == 16, "fdc_new_forward_gemm_nk3_d256 requires N == 6 or 16.");
+    if (idx >= total) {
+        return;
+    }
 
-    auto fopts = h.options().dtype(torch::kFloat32);
+    int t = idx % T;
+    int d = idx / T;
 
-    auto mix_t = torch::empty({N, D}, fopts);
-    auto kc_ktn = torch::empty({K, T, N}, fopts);
-    auto weight = torch::empty({K, T, D}, fopts);
-    auto out = torch::empty({B, D, T}, h.options());
+    int s = off + t - kk;
 
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-    cublasHandle_t handle = at::cuda::getCurrentCUDABlasHandle();
+    if (s >= 0 && s < L) {
+        gh[static_cast<int64_t>(d) * L + s] +=
+            go[static_cast<int64_t>(d) * T + t] *
+            w[static_cast<int64_t>(d) * T + t];
+    }
+}
 
-    fdc_check_cublas(
-        cublasSetStream(handle, stream),
-        "fdc_new_forward_gemm_nk3_d256 cublasSetStream failed"
-    );
+// ======================================================================================
+// row-major SGEMM helper
+//
+// Computes:
+//
+//   C[M,N] = A[M,K] @ B[K,N]
+//
+// for row-major contiguous tensors, using cuBLAS column-major trick.
+// ======================================================================================
 
-    int threads = 256;
+static inline void fdc_new_sgemm_rowmajor(
+    cublasHandle_t handle,
+    const float* A,
+    const float* B,
+    float* C,
+    int M,
+    int N,
+    int K,
+    float beta_value
+) {
+    const float alpha = 1.0f;
+    const float beta = beta_value;
 
-    fdc_new_make_mix_t_float_kernel<scalar_t><<<
-        (D * N + threads - 1) / threads,
-        threads,
-        0,
-        stream
-    >>>(
-        mix.data_ptr<scalar_t>(),
-        mix_t.data_ptr<float>(),
-        D,
-        N
-    );
-
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-
-    fdc_new_make_kc_ktn_float_kernel<scalar_t><<<
-        (K * T * N + threads - 1) / threads,
-        threads,
-        0,
-        stream
-    >>>(
-        kc.data_ptr<scalar_t>(),
-        kc_ktn.data_ptr<float>(),
-        T,
-        N,
-        K
-    );
-
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-
-    float alpha = 1.0f;
-    float beta0 = 0.0f;
-
-    // Compute weight[kk] = kc_kk[T,N] x mix_t[N,D] => [T,D].
-    //
-    // Row-major [T,D] is represented to cuBLAS as column-major [D,T].
-    // C_col[D,T] = mix_t_col[D,N] x kc_col[N,T].
-    //
-    // mix_t memory [N,D] row-major equals column-major [D,N] with ld=D.
-    // kc_ktn memory [T,N] row-major equals column-major [N,T] with ld=N.
-    // weight memory [T,D] row-major equals column-major [D,T] with ld=D.
-    fdc_check_cublas(
-        cublasSgemmStridedBatched(
+    fdc_new_check_cublas_status(
+        cublasSgemm(
             handle,
             CUBLAS_OP_N,
             CUBLAS_OP_N,
-            D,
-            T,
             N,
+            M,
+            K,
             &alpha,
-            mix_t.data_ptr<float>(),
-            D,
-            0,
-            kc_ktn.data_ptr<float>(),
+            B,
             N,
-            static_cast<long long>(T) * N,
-            &beta0,
-            weight.data_ptr<float>(),
-            D,
-            static_cast<long long>(T) * D,
-            K
+            A,
+            K,
+            &beta,
+            C,
+            N
         ),
-        "fdc_new_forward_gemm_nk3_d256 weight SGEMM failed"
-    );
-
-    fdc_new_forward_from_weight_kernel<scalar_t><<<
-        (D * T + threads - 1) / threads,
-        threads,
-        0,
-        stream
-    >>>(
-        h.data_ptr<scalar_t>(),
-        weight.data_ptr<float>(),
-        out.data_ptr<scalar_t>(),
-        D,
-        L,
-        T,
-        K,
-        static_cast<int>(off)
-    );
-
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-
-    return out;
-}
-
-torch::Tensor fdc_new_forward_gemm_nk3_d256_cuda(
-    torch::Tensor h,
-    torch::Tensor kc,
-    torch::Tensor mix,
-    int64_t off
-) {
-    TORCH_CHECK(h.is_cuda(), "h must be CUDA tensor.");
-    TORCH_CHECK(kc.is_cuda(), "kc must be CUDA tensor.");
-    TORCH_CHECK(mix.is_cuda(), "mix must be CUDA tensor.");
-
-    TORCH_CHECK(h.is_contiguous(), "h must be contiguous.");
-    TORCH_CHECK(kc.is_contiguous(), "kc must be contiguous.");
-    TORCH_CHECK(mix.is_contiguous(), "mix must be contiguous.");
-
-    TORCH_CHECK(h.dim() == 3, "h must be [B,D,L].");
-    TORCH_CHECK(kc.dim() == 4, "kc must be [B,T,N,K].");
-    TORCH_CHECK(mix.dim() == 2, "mix must be [D,N].");
-
-    TORCH_CHECK(h.size(0) == 1, "B must be 1.");
-    TORCH_CHECK(h.size(1) == 256, "D must be 256.");
-    TORCH_CHECK(kc.size(0) == 1, "kc B must be 1.");
-    TORCH_CHECK(kc.size(3) == 3, "K must be 3.");
-    TORCH_CHECK(mix.size(0) == 256, "mix D must be 256.");
-    TORCH_CHECK(kc.size(2) == mix.size(1), "N mismatch.");
-    TORCH_CHECK(kc.size(2) == 6 || kc.size(2) == 16, "N must be 6 or 16.");
-
-    TORCH_CHECK(h.scalar_type() == kc.scalar_type(), "h/kc dtype mismatch.");
-    TORCH_CHECK(h.scalar_type() == mix.scalar_type(), "h/mix dtype mismatch.");
-
-    if (h.scalar_type() == at::ScalarType::Float) {
-        return fdc_new_forward_gemm_nk3_d256_typed<float>(
-            h,
-            kc,
-            mix,
-            off
-        );
-    }
-
-    if (h.scalar_type() == at::ScalarType::Half) {
-        return fdc_new_forward_gemm_nk3_d256_typed<c10::Half>(
-            h,
-            kc,
-            mix,
-            off
-        );
-    }
-
-    TORCH_CHECK(
-        h.scalar_type() == at::ScalarType::BFloat16,
-        "unsupported dtype"
-    );
-
-    return fdc_new_forward_gemm_nk3_d256_typed<c10::BFloat16>(
-        h,
-        kc,
-        mix,
-        off
+        "fdc_new_sgemm_rowmajor failed"
     );
 }
 
-// ======================================================================================
-// Backward GEMM materialized plan
-// ======================================================================================
-
-template <typename scalar_t>
-static std::vector<torch::Tensor> fdc_new_backward_gemm_nk3_d256_typed(
-    torch::Tensor go,
-    torch::Tensor h,
-    torch::Tensor kc,
-    torch::Tensor mix,
-    int64_t off
-) {
-    FDC_DEBUG_PATH("FDC path: backward_new_gemm_nk3_d256");
-
-    int B = static_cast<int>(h.size(0));
-    int D = static_cast<int>(h.size(1));
-    int L = static_cast<int>(h.size(2));
-    int T = static_cast<int>(kc.size(1));
-    int N = static_cast<int>(kc.size(2));
-    int K = static_cast<int>(kc.size(3));
-
-    TORCH_CHECK(B == 1, "fdc_new_backward_gemm_nk3_d256 requires B == 1.");
-    TORCH_CHECK(D == 256, "fdc_new_backward_gemm_nk3_d256 requires D == 256.");
-    TORCH_CHECK(K == 3, "fdc_new_backward_gemm_nk3_d256 requires K == 3.");
-    TORCH_CHECK(N == 6 || N == 16, "fdc_new_backward_gemm_nk3_d256 requires N == 6 or 16.");
-
-    auto fopts = h.options().dtype(torch::kFloat32);
-
-    auto mix_t = torch::empty({N, D}, fopts);
-    auto kc_ktn = torch::empty({K, T, N}, fopts);
-    auto base = torch::empty({K, T, D}, fopts);
-    auto weight = torch::empty({K, T, D}, fopts);
-    auto gk_ktn = torch::empty({K, T, N}, fopts);
-    auto gmf = torch::zeros({D, N}, fopts);
-    auto ghf = torch::empty({B, D, L}, fopts);
-
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-    cublasHandle_t handle = at::cuda::getCurrentCUDABlasHandle();
-
-    fdc_check_cublas(
-        cublasSetStream(handle, stream),
-        "fdc_new_backward_gemm_nk3_d256 cublasSetStream failed"
-    );
-
-    int threads = 256;
-
-    fdc_new_make_mix_t_float_kernel<scalar_t><<<
-        (D * N + threads - 1) / threads,
-        threads,
-        0,
-        stream
-    >>>(
-        mix.data_ptr<scalar_t>(),
-        mix_t.data_ptr<float>(),
-        D,
-        N
-    );
-
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-
-    fdc_new_make_kc_ktn_float_kernel<scalar_t><<<
-        (K * T * N + threads - 1) / threads,
-        threads,
-        0,
-        stream
-    >>>(
-        kc.data_ptr<scalar_t>(),
-        kc_ktn.data_ptr<float>(),
-        T,
-        N,
-        K
-    );
-
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-
-    fdc_new_make_base_ktd_float_kernel<scalar_t><<<
-        (static_cast<int64_t>(K) * T * D + threads - 1) / threads,
-        threads,
-        0,
-        stream
-    >>>(
-        go.data_ptr<scalar_t>(),
-        h.data_ptr<scalar_t>(),
-        base.data_ptr<float>(),
-        D,
-        L,
-        T,
-        K,
-        static_cast<int>(off)
-    );
-
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-
-    float alpha = 1.0f;
-    float beta0 = 0.0f;
-    float beta1 = 1.0f;
-
-    // ------------------------------------------------------------------
-    // grad_kernel:
-    //
-    // gk_kk[T,N] = base_kk[T,D] x mix[D,N]
-    //
-    // Row-major gk[T,N] as column-major [N,T].
-    // C_col[N,T] = mix_t_col[N,D] x base_col[D,T].
-    // mix_t memory [N,D] row-major -> column-major [D,N]? 
-    //
-    // We need C [N,T].
-    // A should be [N,D], B should be [D,T].
-    //
-    // mix_t is row-major [N,D], equivalent column-major [D,N].
-    // To see it as [N,D] column-major, use transpose over [D,N].
-    //
-    // Easier:
-    // gk^T[N,T] = mix^T[N,D] x base^T[D,T].
-    //
-    // mix_t memory stores mix^T row-major [N,D].
-    // In cuBLAS column-major, that same memory is [D,N].
-    // Therefore use CUBLAS_OP_T on mix_t with dimensions D x N to get N x D.
-    //
-    // base row-major [T,D] is column-major [D,T], no transpose.
-    // ------------------------------------------------------------------
-    fdc_check_cublas(
-        cublasSgemmStridedBatched(
-            handle,
-            CUBLAS_OP_T,
-            CUBLAS_OP_N,
-            N,
-            T,
-            D,
-            &alpha,
-            mix_t.data_ptr<float>(),
-            D,
-            0,
-            base.data_ptr<float>(),
-            D,
-            static_cast<long long>(T) * D,
-            &beta0,
-            gk_ktn.data_ptr<float>(),
-            N,
-            static_cast<long long>(T) * N,
-            K
-        ),
-        "fdc_new_backward_gemm_nk3_d256 grad_kernel SGEMM failed"
-    );
-
-    // ------------------------------------------------------------------
-    // weight for grad_h:
-    //
-    // weight_kk[T,D] = kc_kk[T,N] x mix_t[N,D]
-    // same as forward materialization.
-    // ------------------------------------------------------------------
-    fdc_check_cublas(
-        cublasSgemmStridedBatched(
-            handle,
-            CUBLAS_OP_N,
-            CUBLAS_OP_N,
-            D,
-            T,
-            N,
-            &alpha,
-            mix_t.data_ptr<float>(),
-            D,
-            0,
-            kc_ktn.data_ptr<float>(),
-            N,
-            static_cast<long long>(T) * N,
-            &beta0,
-            weight.data_ptr<float>(),
-            D,
-            static_cast<long long>(T) * D,
-            K
-        ),
-        "fdc_new_backward_gemm_nk3_d256 weight SGEMM failed"
-    );
-
-    // ------------------------------------------------------------------
-    // grad_mix:
-    //
-    // gm[D,N] += base_kk[T,D]^T x kc_kk[T,N]
-    //
-    // Row-major gm[D,N] equivalent column-major [N,D].
-    // Compute gm_col[N,D] += kc_col[N,T] x base_col[T,D].
-    //
-    // kc_ktn row-major [T,N] equals column-major [N,T], no transpose.
-    // base row-major [T,D] equals column-major [D,T].
-    // Need base_col[T,D], so use CUBLAS_OP_T over [D,T].
-    // ------------------------------------------------------------------
-    for (int kk = 0; kk < K; ++kk) {
-        fdc_check_cublas(
-            cublasSgemm(
-                handle,
-                CUBLAS_OP_N,
-                CUBLAS_OP_T,
-                N,
-                D,
-                T,
-                &alpha,
-                kc_ktn.data_ptr<float>() + static_cast<int64_t>(kk) * T * N,
-                N,
-                base.data_ptr<float>() + static_cast<int64_t>(kk) * T * D,
-                D,
-                &beta1,
-                gmf.data_ptr<float>(),
-                N
-            ),
-            "fdc_new_backward_gemm_nk3_d256 grad_mix SGEMM failed"
-        );
-    }
-
-    fdc_new_grad_h_from_weight_kernel<scalar_t><<<
-        (D * L + threads - 1) / threads,
-        threads,
-        0,
-        stream
-    >>>(
-        go.data_ptr<scalar_t>(),
-        weight.data_ptr<float>(),
-        ghf.data_ptr<float>(),
-        D,
-        L,
-        T,
-        K,
-        static_cast<int>(off)
-    );
-
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-
-    auto gh = torch::empty_like(h);
-    auto gk = torch::empty_like(kc);
-    auto gm = torch::empty_like(mix);
-
-    fdc_new_cast_float_to_scalar_kernel<scalar_t><<<
-        (gh.numel() + threads - 1) / threads,
-        threads,
-        0,
-        stream
-    >>>(
-        ghf.data_ptr<float>(),
-        gh.data_ptr<scalar_t>(),
-        gh.numel()
-    );
-
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-
-    fdc_new_scatter_gk_ktn_to_btnk_kernel<scalar_t><<<
-        (T * N * K + threads - 1) / threads,
-        threads,
-        0,
-        stream
-    >>>(
-        gk_ktn.data_ptr<float>(),
-        gk.data_ptr<scalar_t>(),
-        T,
-        N,
-        K
-    );
-
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-
-    fdc_new_scatter_gm_float_to_scalar_kernel<scalar_t><<<
-        (D * N + threads - 1) / threads,
-        threads,
-        0,
-        stream
-    >>>(
-        gmf.data_ptr<float>(),
-        gm.data_ptr<scalar_t>(),
-        D,
-        N
-    );
-
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-
-    return {
-        gh,
-        gk,
-        gm
-    };
-}
-
-std::vector<torch::Tensor> fdc_new_backward_gemm_nk3_d256_cuda(
-    torch::Tensor go,
-    torch::Tensor h,
-    torch::Tensor kc,
-    torch::Tensor mix,
-    int64_t off
-) {
-    TORCH_CHECK(go.is_cuda(), "go must be CUDA tensor.");
-    TORCH_CHECK(h.is_cuda(), "h must be CUDA tensor.");
-    TORCH_CHECK(kc.is_cuda(), "kc must be CUDA tensor.");
-    TORCH_CHECK(mix.is_cuda(), "mix must be CUDA tensor.");
-
-    TORCH_CHECK(go.is_contiguous(), "go must be contiguous.");
-    TORCH_CHECK(h.is_contiguous(), "h must be contiguous.");
-    TORCH_CHECK(kc.is_contiguous(), "kc must be contiguous.");
-    TORCH_CHECK(mix.is_contiguous(), "mix must be contiguous.");
-
-    TORCH_CHECK(go.dim() == 3, "go must be [B,D,T].");
-    TORCH_CHECK(h.dim() == 3, "h must be [B,D,L].");
-    TORCH_CHECK(kc.dim() == 4, "kc must be [B,T,N,K].");
-    TORCH_CHECK(mix.dim() == 2, "mix must be [D,N].");
-
-    TORCH_CHECK(h.size(0) == 1, "B must be 1.");
-    TORCH_CHECK(h.size(1) == 256, "D must be 256.");
-    TORCH_CHECK(kc.size(0) == 1, "kc B must be 1.");
-    TORCH_CHECK(kc.size(3) == 3, "K must be 3.");
-    TORCH_CHECK(mix.size(0) == 256, "mix D must be 256.");
-    TORCH_CHECK(kc.size(2) == mix.size(1), "N mismatch.");
-    TORCH_CHECK(kc.size(2) == 6 || kc.size(2) == 16, "N must be 6 or 16.");
-
-    TORCH_CHECK(go.size(0) == h.size(0), "go B mismatch.");
-    TORCH_CHECK(go.size(1) == h.size(1), "go D mismatch.");
-    TORCH_CHECK(go.size(2) == kc.size(1), "go T mismatch.");
-
-    TORCH_CHECK(h.scalar_type() == go.scalar_type(), "go dtype mismatch.");
-    TORCH_CHECK(h.scalar_type() == kc.scalar_type(), "kc dtype mismatch.");
-    TORCH_CHECK(h.scalar_type() == mix.scalar_type(), "mix dtype mismatch.");
-
-    if (h.scalar_type() == at::ScalarType::Float) {
-        return fdc_new_backward_gemm_nk3_d256_typed<float>(
-            go,
-            h,
-            kc,
-            mix,
-            off
-        );
-    }
-
-    if (h.scalar_type() == at::ScalarType::Half) {
-        return fdc_new_backward_gemm_nk3_d256_typed<c10::Half>(
-            go,
-            h,
-            kc,
-            mix,
-            off
-        );
-    }
-
-    TORCH_CHECK(
-        h.scalar_type() == at::ScalarType::BFloat16,
-        "unsupported dtype"
-    );
-
-    return fdc_new_backward_gemm_nk3_d256_typed<c10::BFloat16>(
-        go,
-        h,
-        kc,
-        mix,
-        off
-    );
-}
+} // namespace
 
 // ======================================================================================
 // Availability
@@ -782,97 +446,483 @@ bool fdc_new_gemm_nk3_d256_available_cuda(
     int64_t off,
     int64_t dilation
 ) {
-    if (!h.is_cuda()) {
+    if (!fdc_new_shape_ok(
+            h,
+            kc,
+            mix,
+            off,
+            dilation
+        )) {
         return false;
     }
 
-    if (!kc.is_cuda()) {
+    int64_t T = kc.size(3);
+    int64_t N = kc.size(2);
+
+    if (N < 8) {
         return false;
     }
 
-    if (!mix.is_cuda()) {
-        return false;
-    }
-
-    if (!h.is_contiguous()) {
-        return false;
-    }
-
-    if (!kc.is_contiguous()) {
-        return false;
-    }
-
-    if (!mix.is_contiguous()) {
-        return false;
-    }
-
-    if (h.dim() != 3) {
-        return false;
-    }
-
-    if (kc.dim() != 4) {
-        return false;
-    }
-
-    if (mix.dim() != 2) {
-        return false;
-    }
-
-    if (
-        h.scalar_type() != at::ScalarType::Float &&
-        h.scalar_type() != at::ScalarType::Half &&
-        h.scalar_type() != at::ScalarType::BFloat16
-    ) {
-        return false;
-    }
-
-    if (kc.scalar_type() != h.scalar_type()) {
-        return false;
-    }
-
-    if (mix.scalar_type() != h.scalar_type()) {
-        return false;
-    }
-
-    if (h.size(0) != 1) {
-        return false;
-    }
-
-    if (h.size(1) != 256) {
-        return false;
-    }
-
-    if (kc.size(0) != 1) {
-        return false;
-    }
-
-    if (kc.size(3) != 3) {
-        return false;
-    }
-
-    if (mix.size(0) != 256) {
-        return false;
-    }
-
-    if (kc.size(2) != mix.size(1)) {
-        return false;
-    }
-
-    if (kc.size(2) != 6 && kc.size(2) != 16) {
-        return false;
-    }
-
-    if (dilation != 1) {
-        return false;
-    }
-
-    if (off < 0) {
-        return false;
-    }
-
-    if (off + kc.size(1) > h.size(2)) {
+    if (T < 512) {
         return false;
     }
 
     return true;
+}
+
+// ======================================================================================
+// Forward
+// ======================================================================================
+
+torch::Tensor fdc_new_forward_gemm_nk3_d256_cuda(
+    torch::Tensor h,
+    torch::Tensor kc,
+    torch::Tensor mix,
+    int64_t off
+) {
+    TORCH_CHECK(h.defined(), "h must be defined.");
+    TORCH_CHECK(kc.defined(), "kc must be defined.");
+    TORCH_CHECK(mix.defined(), "mix must be defined.");
+
+    TORCH_CHECK(h.is_cuda(), "h must be CUDA tensor.");
+    TORCH_CHECK(kc.is_cuda(), "kc must be CUDA tensor.");
+    TORCH_CHECK(mix.is_cuda(), "mix must be CUDA tensor.");
+
+    TORCH_CHECK(h.is_contiguous(), "h must be contiguous.");
+    TORCH_CHECK(kc.is_contiguous(), "kc must be contiguous.");
+    TORCH_CHECK(mix.is_contiguous(), "mix must be contiguous.");
+
+    TORCH_CHECK(h.dim() == 3, "h must be [B,D,L].");
+    TORCH_CHECK(kc.dim() == 4, "kc must be [B,K,N,T].");
+    TORCH_CHECK(mix.dim() == 2, "mix must be [D,N].");
+
+    TORCH_CHECK(h.scalar_type() == at::ScalarType::Float, "h must be float32.");
+    TORCH_CHECK(kc.scalar_type() == at::ScalarType::Float, "kc must be float32.");
+    TORCH_CHECK(mix.scalar_type() == at::ScalarType::Float, "mix must be float32.");
+
+    TORCH_CHECK(h.size(0) == 1, "new_gemm_nk3_d256 requires B == 1.");
+    TORCH_CHECK(kc.size(0) == 1, "new_gemm_nk3_d256 requires kc B == 1.");
+    TORCH_CHECK(h.size(1) == FDC_NEW_D, "new_gemm_nk3_d256 requires D == 256.");
+    TORCH_CHECK(kc.size(1) == FDC_NEW_K, "new_gemm_nk3_d256 requires K == 3.");
+    TORCH_CHECK(mix.size(0) == FDC_NEW_D, "mix D mismatch.");
+    TORCH_CHECK(mix.size(1) == kc.size(2), "mix N mismatch.");
+    TORCH_CHECK(off >= 0, "off must be >= 0.");
+    TORCH_CHECK(off + kc.size(3) <= h.size(2), "off + T must be <= L.");
+
+    int L = static_cast<int>(h.size(2));
+    int N = static_cast<int>(kc.size(2));
+    int T = static_cast<int>(kc.size(3));
+
+    auto out = torch::empty(
+        {
+            1,
+            FDC_NEW_D,
+            T,
+        },
+        h.options()
+    );
+
+    auto tmp = torch::empty(
+        {
+            FDC_NEW_K,
+            FDC_NEW_D,
+            T,
+        },
+        h.options()
+    );
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    cublasHandle_t handle = at::cuda::getCurrentCUDABlasHandle();
+
+    fdc_new_check_cublas_status(
+        cublasSetStream(
+            handle,
+            stream
+        ),
+        "cublasSetStream failed in fdc_new_forward_gemm_nk3_d256_cuda"
+    );
+
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+
+    const float* mix_ptr = mix.data_ptr<float>();
+    const float* kc_ptr = kc.data_ptr<float>();
+    float* tmp_ptr = tmp.data_ptr<float>();
+
+#pragma unroll
+    for (int kk = 0; kk < FDC_NEW_K; ++kk) {
+        const float* A = kc_ptr + static_cast<int64_t>(kk) * N * T;
+        const float* B = mix_ptr;
+        float* C = tmp_ptr + static_cast<int64_t>(kk) * FDC_NEW_D * T;
+
+        /*
+         * Row-major logical:
+         *
+         *   C_row[256,T] = mix[256,N] @ kc_kk[N,T]
+         *
+         * cuBLAS column-major trick:
+         *
+         *   C_col[T,256] = kc_kk_col[T,N] @ mix_col[N,256]
+         */
+        fdc_new_check_cublas_status(
+            cublasSgemm(
+                handle,
+                CUBLAS_OP_N,
+                CUBLAS_OP_N,
+                T,
+                FDC_NEW_D,
+                N,
+                &alpha,
+                A,
+                T,
+                B,
+                N,
+                &beta,
+                C,
+                T
+            ),
+            "cublasSgemm failed in fdc_new_forward_gemm_nk3_d256_cuda"
+        );
+    }
+
+    int total = FDC_NEW_D * T;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+
+    if (static_cast<int>(off) >= 2) {
+        fdc_new_forward_combine_noboundary_kernel<<<
+            blocks,
+            threads,
+            0,
+            stream
+        >>>(
+            h.data_ptr<float>(),
+            tmp.data_ptr<float>(),
+            out.data_ptr<float>(),
+            L,
+            T,
+            static_cast<int>(off)
+        );
+    } else {
+        fdc_new_forward_combine_boundary_kernel<<<
+            blocks,
+            threads,
+            0,
+            stream
+        >>>(
+            h.data_ptr<float>(),
+            tmp.data_ptr<float>(),
+            out.data_ptr<float>(),
+            L,
+            T,
+            static_cast<int>(off)
+        );
+    }
+
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    FDC_DEBUG_PATH("forward_new_gemm_nk3_d256_bknt");
+
+    return out;
+}
+
+// ======================================================================================
+// Backward
+// ======================================================================================
+
+std::vector<torch::Tensor> fdc_new_backward_gemm_nk3_d256_cuda(
+    torch::Tensor go,
+    torch::Tensor h,
+    torch::Tensor kc,
+    torch::Tensor mix,
+    int64_t off
+) {
+    FDC_DEBUG_PATH("FDC path: backward_new_gemm_nk3_d256_bknt");
+
+    TORCH_CHECK(go.defined(), "go must be defined.");
+    TORCH_CHECK(h.defined(), "h must be defined.");
+    TORCH_CHECK(kc.defined(), "kc must be defined.");
+    TORCH_CHECK(mix.defined(), "mix must be defined.");
+
+    TORCH_CHECK(go.is_cuda(), "go must be CUDA tensor.");
+    TORCH_CHECK(h.is_cuda(), "h must be CUDA tensor.");
+    TORCH_CHECK(kc.is_cuda(), "kc must be CUDA tensor.");
+    TORCH_CHECK(mix.is_cuda(), "mix must be CUDA tensor.");
+
+    TORCH_CHECK(go.is_contiguous(), "go must be contiguous.");
+    TORCH_CHECK(h.is_contiguous(), "h must be contiguous.");
+    TORCH_CHECK(kc.is_contiguous(), "kc must be contiguous.");
+    TORCH_CHECK(mix.is_contiguous(), "mix must be contiguous.");
+
+    TORCH_CHECK(go.dim() == 3, "go must be [B,D,T].");
+    TORCH_CHECK(h.dim() == 3, "h must be [B,D,L].");
+    TORCH_CHECK(kc.dim() == 4, "kc must be [B,K,N,T].");
+    TORCH_CHECK(mix.dim() == 2, "mix must be [D,N].");
+
+    TORCH_CHECK(go.scalar_type() == at::ScalarType::Float, "go must be float32.");
+    TORCH_CHECK(h.scalar_type() == at::ScalarType::Float, "h must be float32.");
+    TORCH_CHECK(kc.scalar_type() == at::ScalarType::Float, "kc must be float32.");
+    TORCH_CHECK(mix.scalar_type() == at::ScalarType::Float, "mix must be float32.");
+
+    TORCH_CHECK(h.size(0) == 1, "new backward requires B == 1.");
+    TORCH_CHECK(go.size(0) == 1, "go B mismatch.");
+    TORCH_CHECK(kc.size(0) == 1, "kc B mismatch.");
+
+    TORCH_CHECK(h.size(1) == FDC_NEW_D, "new backward requires h D == 256.");
+    TORCH_CHECK(go.size(1) == FDC_NEW_D, "new backward requires go D == 256.");
+    TORCH_CHECK(mix.size(0) == FDC_NEW_D, "mix D mismatch.");
+
+    TORCH_CHECK(kc.size(1) == FDC_NEW_K, "new backward requires K == 3.");
+    TORCH_CHECK(mix.size(1) == kc.size(2), "mix N mismatch.");
+    TORCH_CHECK(go.size(2) == kc.size(3), "go T mismatch.");
+
+    TORCH_CHECK(off >= 0, "off must be >= 0.");
+    TORCH_CHECK(off + kc.size(3) <= h.size(2), "off + T must be <= L.");
+
+    int L = static_cast<int>(h.size(2));
+    int N = static_cast<int>(kc.size(2));
+    int T = static_cast<int>(kc.size(3));
+
+    auto gh = torch::empty(
+        h.sizes(),
+        h.options()
+    );
+
+    auto gk = torch::empty(
+        kc.sizes(),
+        kc.options()
+    );
+
+    auto gm = torch::empty(
+        mix.sizes(),
+        mix.options()
+    );
+
+    auto x_dt = torch::empty(
+        {
+            FDC_NEW_D,
+            T,
+        },
+        h.options()
+    );
+
+    auto x_td = torch::empty(
+        {
+            T,
+            FDC_NEW_D,
+        },
+        h.options()
+    );
+
+    auto kc_tn = torch::empty(
+        {
+            T,
+            N,
+        },
+        h.options()
+    );
+
+    auto kc_nt = torch::empty(
+        {
+            N,
+            T,
+        },
+        h.options()
+    );
+
+    auto w = torch::empty(
+        {
+            FDC_NEW_D,
+            T,
+        },
+        h.options()
+    );
+
+    auto gk_tn = torch::empty(
+        {
+            T,
+            N,
+        },
+        h.options()
+    );
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    cublasHandle_t handle = at::cuda::getCurrentCUDABlasHandle();
+
+    fdc_new_check_cublas_status(
+        cublasSetStream(
+            handle,
+            stream
+        ),
+        "cublasSetStream failed in fdc_new_backward_gemm_nk3_d256_cuda"
+    );
+
+    int threads = 256;
+
+    fdc_new_zero_float_kernel<<<
+        (gh.numel() + threads - 1) / threads,
+        threads,
+        0,
+        stream
+    >>>(
+        gh.data_ptr<float>(),
+        gh.numel()
+    );
+
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    fdc_new_zero_float_kernel<<<
+        (gm.numel() + threads - 1) / threads,
+        threads,
+        0,
+        stream
+    >>>(
+        gm.data_ptr<float>(),
+        gm.numel()
+    );
+
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    for (int kk = 0; kk < FDC_NEW_K; ++kk) {
+        fdc_new_backward_build_x_kernel<<<
+            (static_cast<int64_t>(FDC_NEW_D) * T + threads - 1) / threads,
+            threads,
+            0,
+            stream
+        >>>(
+            go.data_ptr<float>(),
+            h.data_ptr<float>(),
+            x_dt.data_ptr<float>(),
+            x_td.data_ptr<float>(),
+            L,
+            T,
+            static_cast<int>(off),
+            kk
+        );
+
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+        fdc_new_backward_build_kc_kernel<<<
+            (static_cast<int64_t>(T) * N + threads - 1) / threads,
+            threads,
+            0,
+            stream
+        >>>(
+            kc.data_ptr<float>(),
+            kc_tn.data_ptr<float>(),
+            kc_nt.data_ptr<float>(),
+            T,
+            N,
+            kk
+        );
+
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+        /*
+         * w = mix @ kc_nt
+         *
+         * mix:
+         *   [256,N]
+         *
+         * kc_nt:
+         *   [N,T]
+         *
+         * w:
+         *   [256,T]
+         */
+        fdc_new_sgemm_rowmajor(
+            handle,
+            mix.data_ptr<float>(),
+            kc_nt.data_ptr<float>(),
+            w.data_ptr<float>(),
+            FDC_NEW_D,
+            T,
+            N,
+            0.0f
+        );
+
+        fdc_new_backward_accum_gh_kernel<<<
+            (static_cast<int64_t>(FDC_NEW_D) * T + threads - 1) / threads,
+            threads,
+            0,
+            stream
+        >>>(
+            go.data_ptr<float>(),
+            w.data_ptr<float>(),
+            gh.data_ptr<float>(),
+            L,
+            T,
+            static_cast<int>(off),
+            kk
+        );
+
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+        /*
+         * gk_tn = x_td @ mix
+         *
+         * x_td:
+         *   [T,256]
+         *
+         * mix:
+         *   [256,N]
+         *
+         * gk_tn:
+         *   [T,N]
+         */
+        fdc_new_sgemm_rowmajor(
+            handle,
+            x_td.data_ptr<float>(),
+            mix.data_ptr<float>(),
+            gk_tn.data_ptr<float>(),
+            T,
+            N,
+            FDC_NEW_D,
+            0.0f
+        );
+
+        fdc_new_backward_write_gk_kernel<<<
+            (static_cast<int64_t>(T) * N + threads - 1) / threads,
+            threads,
+            0,
+            stream
+        >>>(
+            gk_tn.data_ptr<float>(),
+            gk.data_ptr<float>(),
+            T,
+            N,
+            kk
+        );
+
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+        /*
+         * gm += x_dt @ kc_tn
+         *
+         * x_dt:
+         *   [256,T]
+         *
+         * kc_tn:
+         *   [T,N]
+         *
+         * gm:
+         *   [256,N]
+         */
+        fdc_new_sgemm_rowmajor(
+            handle,
+            x_dt.data_ptr<float>(),
+            kc_tn.data_ptr<float>(),
+            gm.data_ptr<float>(),
+            FDC_NEW_D,
+            N,
+            T,
+            kk == 0 ? 0.0f : 1.0f
+        );
+    }
+
+    return {
+        gh,
+        gk,
+        gm
+    };
 }

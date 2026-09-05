@@ -96,7 +96,7 @@ __global__ void fdc_fp16_gemmex_make_base_half_kernel(
         int b = q / T;
 
         float v = fdc_to_float_dev(
-            kc[(static_cast<int64_t>(b) * T + t) * N * K + n * K + kk]
+            kc[((static_cast<int64_t>(b) * K + kk) * N + n) * T + t]
         );
 
         kbtn[(static_cast<int64_t>(b) * T + t) * N + n] =
@@ -126,7 +126,7 @@ __global__ void fdc_fp16_gemmex_copy_gk_float_to_scalar_kernel(
     int t = q % T;
     int b = q / T;
 
-    dst[(static_cast<int64_t>(b) * T + t) * N * K + n * K + kk] =
+    dst[((static_cast<int64_t>(b) * K + kk) * N + n) * T + t] =
         fdc_from_float_dev<scalar_t>(src[i]);
 }
 
@@ -170,13 +170,13 @@ __global__ void fdc_fp16_gemmex_grad_h_gather_kernel(
             continue;
         }
 
-        int64_t kbase = (static_cast<int64_t>(b) * T + t) * N * K;
-
         float w = 0.0f;
 
         for (int n = 0; n < N; ++n) {
             w +=
-                fdc_to_float_dev(kc[kbase + n * K + kk]) *
+                fdc_to_float_dev(
+                    kc[((static_cast<int64_t>(b) * K + kk) * N + n) * T + t]
+                ) *
                 fdc_to_float_dev(mix[mbase + n]);
         }
 
@@ -198,7 +198,7 @@ std::vector<torch::Tensor> fdc_backward_fp16_gemmex_v3_cuda(
     int64_t off,
     int64_t dilation
 ) {
-    FDC_DEBUG_PATH("FDC path: backward_fp16_gemmex_v3");
+    FDC_DEBUG_PATH("FDC path: backward_fp16_gemmex_v3_bknt");
 
     TORCH_CHECK(
         h.scalar_type() == at::ScalarType::Half,
@@ -208,9 +208,9 @@ std::vector<torch::Tensor> fdc_backward_fp16_gemmex_v3_cuda(
     int B = static_cast<int>(h.size(0));
     int D = static_cast<int>(h.size(1));
     int L = static_cast<int>(h.size(2));
-    int T = static_cast<int>(kc.size(1));
+    int K = static_cast<int>(kc.size(1));
     int N = static_cast<int>(kc.size(2));
-    int K = static_cast<int>(kc.size(3));
+    int T = static_cast<int>(kc.size(3));
 
     auto fopts = h.options().dtype(torch::kFloat32);
     auto hopts = h.options().dtype(torch::kFloat16);

@@ -19,17 +19,11 @@
 //   dtype = float32
 //   dilation = 1
 //
-// Standalone GEMM-based plan:
+// kc layout is now:
 //
-//   kc[1,T,64,3] -> kc_pack[3,64,T]
+//   kc: [1,3,64,T]
 //
-//   tmp_k[256,T] = mix[256,64] @ kc_pack_k[64,T]
-//
-//   out[d,t] =
-//       tmp_0[d,t] * h[d, off+t]
-//     + tmp_1[d,t] * h[d, off+t-1]
-//     + tmp_2[d,t] * h[d, off+t-2]
-//
+// No pack kernel.
 // ======================================================================================
 
 namespace {
@@ -91,15 +85,15 @@ static inline bool fdc_forward_n64_shape_ok(
         return false;
     }
 
+    if (kc.size(1) != FDC_FWD_N64_K) {
+        return false;
+    }
+
     if (kc.size(2) != FDC_FWD_N64_N) {
         return false;
     }
 
     if (mix.size(1) != FDC_FWD_N64_N) {
-        return false;
-    }
-
-    if (kc.size(3) != FDC_FWD_N64_K) {
         return false;
     }
 
@@ -111,34 +105,11 @@ static inline bool fdc_forward_n64_shape_ok(
         return false;
     }
 
-    if (off + kc.size(1) > h.size(2)) {
+    if (off + kc.size(3) > h.size(2)) {
         return false;
     }
 
     return true;
-}
-
-__global__ void fdc_forward_n64_pack_kc_kernel(
-    const float* __restrict__ kc,
-    float* __restrict__ kc_pack,
-    int T
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = FDC_FWD_N64_K * FDC_FWD_N64_N * T;
-
-    if (idx >= total) {
-        return;
-    }
-
-    int t = idx % T;
-    int q = idx / T;
-    int n = q % FDC_FWD_N64_N;
-    int k = q / FDC_FWD_N64_N;
-
-    int64_t src = ((int64_t)t * FDC_FWD_N64_N + n) * FDC_FWD_N64_K + k;
-    int64_t dst = ((int64_t)k * FDC_FWD_N64_N + n) * T + t;
-
-    kc_pack[dst] = kc[src];
 }
 
 __global__ void fdc_forward_n64_combine_noboundary_kernel(
@@ -234,9 +205,8 @@ bool fdc_forward_n64_k3_d256_available_cuda(
         return false;
     }
 
-    int64_t T = kc.size(1);
+    int64_t T = kc.size(3);
 
-    // N=64 has enough arithmetic intensity. Enable for target large-T cases.
     if (T < 1024) {
         return false;
     }
@@ -263,7 +233,7 @@ torch::Tensor fdc_forward_n64_k3_d256_cuda(
     TORCH_CHECK(mix.is_contiguous(), "mix must be contiguous.");
 
     TORCH_CHECK(h.dim() == 3, "h must be [B,D,L].");
-    TORCH_CHECK(kc.dim() == 4, "kc must be [B,T,N,K].");
+    TORCH_CHECK(kc.dim() == 4, "kc must be [B,K,N,T].");
     TORCH_CHECK(mix.dim() == 2, "mix must be [D,N].");
 
     TORCH_CHECK(h.scalar_type() == at::ScalarType::Float, "h must be float32.");
@@ -274,22 +244,17 @@ torch::Tensor fdc_forward_n64_k3_d256_cuda(
     TORCH_CHECK(kc.size(0) == 1, "forward_n64_k3_d256 requires kc B == 1.");
     TORCH_CHECK(h.size(1) == FDC_FWD_N64_D, "forward_n64_k3_d256 requires D == 256.");
     TORCH_CHECK(mix.size(0) == FDC_FWD_N64_D, "forward_n64_k3_d256 requires mix D == 256.");
+    TORCH_CHECK(kc.size(1) == FDC_FWD_N64_K, "forward_n64_k3_d256 requires K == 3.");
     TORCH_CHECK(kc.size(2) == FDC_FWD_N64_N, "forward_n64_k3_d256 requires N == 64.");
     TORCH_CHECK(mix.size(1) == FDC_FWD_N64_N, "forward_n64_k3_d256 requires mix N == 64.");
-    TORCH_CHECK(kc.size(3) == FDC_FWD_N64_K, "forward_n64_k3_d256 requires K == 3.");
     TORCH_CHECK(off >= 0, "off must be >= 0.");
-    TORCH_CHECK(off + kc.size(1) <= h.size(2), "off + T must be <= L.");
+    TORCH_CHECK(off + kc.size(3) <= h.size(2), "off + T must be <= L.");
 
     int L = static_cast<int>(h.size(2));
-    int T = static_cast<int>(kc.size(1));
+    int T = static_cast<int>(kc.size(3));
 
     auto out = torch::empty(
         {1, FDC_FWD_N64_D, T},
-        h.options()
-    );
-
-    auto kc_pack = torch::empty(
-        {FDC_FWD_N64_K, FDC_FWD_N64_N, T},
         h.options()
     );
 
@@ -299,23 +264,6 @@ torch::Tensor fdc_forward_n64_k3_d256_cuda(
     );
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-
-    int pack_total = FDC_FWD_N64_K * FDC_FWD_N64_N * T;
-    int pack_block = 256;
-    int pack_grid = (pack_total + pack_block - 1) / pack_block;
-
-    fdc_forward_n64_pack_kc_kernel<<<
-        pack_grid,
-        pack_block,
-        0,
-        stream
-    >>>(
-        kc.data_ptr<float>(),
-        kc_pack.data_ptr<float>(),
-        T
-    );
-
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
 
     cublasHandle_t handle = at::cuda::getCurrentCUDABlasHandle();
 
@@ -331,12 +279,12 @@ torch::Tensor fdc_forward_n64_k3_d256_cuda(
     const float beta = 0.0f;
 
     const float* mix_ptr = mix.data_ptr<float>();
-    const float* kc_pack_ptr = kc_pack.data_ptr<float>();
+    const float* kc_ptr = kc.data_ptr<float>();
     float* tmp_ptr = tmp.data_ptr<float>();
 
 #pragma unroll
     for (int kk = 0; kk < FDC_FWD_N64_K; ++kk) {
-        const float* A = kc_pack_ptr + (int64_t)kk * FDC_FWD_N64_N * T;
+        const float* A = kc_ptr + (int64_t)kk * FDC_FWD_N64_N * T;
         const float* B = mix_ptr;
         float* C = tmp_ptr + (int64_t)kk * FDC_FWD_N64_D * T;
 
@@ -397,7 +345,7 @@ torch::Tensor fdc_forward_n64_k3_d256_cuda(
 
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
-    FDC_DEBUG_PATH("forward_n64_k3_d256_sgemm3_pack_combine");
+    FDC_DEBUG_PATH("forward_n64_k3_d256_sgemm3_direct_bknt_combine");
 
     return out;
 }

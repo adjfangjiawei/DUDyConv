@@ -10,21 +10,14 @@
 // ======================================================================================
 // Forward direct execution implementations
 //
-// This file only contains actual CUDA kernels and direct execution wrappers.
-// Plan selection / cache / warmup logic is in:
+// kc layout is now:
 //
-//   cuda_ops/fused_dynamic_conv_forward_direct.cu
+//   [B,K,N,T]
 //
-// Public wrappers exported here:
+// contiguous offset:
 //
-//   fdc_forward_direct_generic_2d_cuda
-//   fdc_forward_direct_generic_smalln_preload_cuda
-//   fdc_forward_direct_n6k3_d256_cuda
-//   fdc_forward_direct_n16k3_d256_cuda
-//   fdc_forward_direct_n6k7_d256_cuda
-//   fdc_forward_direct_n6k3_d512_cuda
+//   kc[b,kk,n,t] = ((b * K + kk) * N + n) * T + t
 // ======================================================================================
-
 
 // ======================================================================================
 // Kernels: generic 2D
@@ -57,7 +50,6 @@ __global__ void fdc_forward_direct_generic_2d_kernel(
 
     int64_t hbase = ((int64_t)b * D + d) * L;
     int64_t obase = ((int64_t)b * D + d) * T;
-    int64_t kbase = ((int64_t)b * T + t) * N * K;
     int64_t mbase = (int64_t)d * N;
 
     for (int kk = 0; kk < K; ++kk) {
@@ -69,8 +61,10 @@ __global__ void fdc_forward_direct_generic_2d_kernel(
 
         float w = 0.0f;
 
+        int64_t kbase = ((int64_t)b * K + kk) * N * T + t;
+
         for (int n = 0; n < N; ++n) {
-            w += fdc_to_float_dev(kc[kbase + n * K + kk]) *
+            w += fdc_to_float_dev(kc[kbase + (int64_t)n * T]) *
                  fdc_to_float_dev(mix[mbase + n]);
         }
 
@@ -113,7 +107,6 @@ __global__ void fdc_forward_direct_generic_smalln_preload_kernel(
 
     int64_t hbase = ((int64_t)b * D + d) * L;
     int64_t obase = ((int64_t)b * D + d) * T;
-    int64_t kbase = ((int64_t)b * T + t) * N * K;
     int64_t mbase = (int64_t)d * N;
 
     float m[16];
@@ -140,8 +133,10 @@ __global__ void fdc_forward_direct_generic_smalln_preload_kernel(
 
         float w = 0.0f;
 
+        int64_t kbase = ((int64_t)b * K + kk) * N * T + t;
+
         for (int n = 0; n < N; ++n) {
-            w += fdc_to_float_dev(kc[kbase + n * K + kk]) * m[n];
+            w += fdc_to_float_dev(kc[kbase + (int64_t)n * T]) * m[n];
         }
 
         acc += w * fdc_to_float_dev(h[hbase + s]);
@@ -152,6 +147,7 @@ __global__ void fdc_forward_direct_generic_smalln_preload_kernel(
 
 // ======================================================================================
 // Kernels: B=1, D=256, N=6, K=3, dilation=1
+// kc: [1,3,6,T]
 // ======================================================================================
 
 template <typename scalar_t, bool NO_BOUNDARY>
@@ -193,15 +189,15 @@ __global__ void fdc_forward_direct_n6k3_d256_kernel(
             }
         }
 
-        int64_t kb = (int64_t)t * 18 + kk;
+        int64_t kb = (int64_t)kk * 6 * T + t;
 
         float w =
-            fdc_to_float_dev(kc[kb + 0 * 3]) * m0 +
-            fdc_to_float_dev(kc[kb + 1 * 3]) * m1 +
-            fdc_to_float_dev(kc[kb + 2 * 3]) * m2 +
-            fdc_to_float_dev(kc[kb + 3 * 3]) * m3 +
-            fdc_to_float_dev(kc[kb + 4 * 3]) * m4 +
-            fdc_to_float_dev(kc[kb + 5 * 3]) * m5;
+            fdc_to_float_dev(kc[kb + 0 * T]) * m0 +
+            fdc_to_float_dev(kc[kb + 1 * T]) * m1 +
+            fdc_to_float_dev(kc[kb + 2 * T]) * m2 +
+            fdc_to_float_dev(kc[kb + 3 * T]) * m3 +
+            fdc_to_float_dev(kc[kb + 4 * T]) * m4 +
+            fdc_to_float_dev(kc[kb + 5 * T]) * m5;
 
         acc += w * fdc_to_float_dev(h[(int64_t)d * L + s]);
     }
@@ -211,6 +207,7 @@ __global__ void fdc_forward_direct_n6k3_d256_kernel(
 
 // ======================================================================================
 // Kernels: B=1, D=512, N=6, K=3, dilation=1
+// kc: [1,3,6,T]
 // ======================================================================================
 
 template <typename scalar_t, bool NO_BOUNDARY>
@@ -252,15 +249,15 @@ __global__ void fdc_forward_direct_n6k3_d512_kernel(
             }
         }
 
-        int64_t kb = (int64_t)t * 18 + kk;
+        int64_t kb = (int64_t)kk * 6 * T + t;
 
         float w =
-            fdc_to_float_dev(kc[kb + 0 * 3]) * m0 +
-            fdc_to_float_dev(kc[kb + 1 * 3]) * m1 +
-            fdc_to_float_dev(kc[kb + 2 * 3]) * m2 +
-            fdc_to_float_dev(kc[kb + 3 * 3]) * m3 +
-            fdc_to_float_dev(kc[kb + 4 * 3]) * m4 +
-            fdc_to_float_dev(kc[kb + 5 * 3]) * m5;
+            fdc_to_float_dev(kc[kb + 0 * T]) * m0 +
+            fdc_to_float_dev(kc[kb + 1 * T]) * m1 +
+            fdc_to_float_dev(kc[kb + 2 * T]) * m2 +
+            fdc_to_float_dev(kc[kb + 3 * T]) * m3 +
+            fdc_to_float_dev(kc[kb + 4 * T]) * m4 +
+            fdc_to_float_dev(kc[kb + 5 * T]) * m5;
 
         acc += w * fdc_to_float_dev(h[(int64_t)d * L + s]);
     }
@@ -283,9 +280,9 @@ static torch::Tensor fdc_run_forward_direct_generic_2d_typed(
     int B = static_cast<int>(h.size(0));
     int D = static_cast<int>(h.size(1));
     int L = static_cast<int>(h.size(2));
-    int T = static_cast<int>(kc.size(1));
+    int K = static_cast<int>(kc.size(1));
     int N = static_cast<int>(kc.size(2));
-    int K = static_cast<int>(kc.size(3));
+    int T = static_cast<int>(kc.size(3));
 
     auto out = torch::empty(
         {B, D, T},
@@ -341,9 +338,9 @@ static torch::Tensor fdc_run_forward_direct_generic_smalln_preload_typed(
     int B = static_cast<int>(h.size(0));
     int D = static_cast<int>(h.size(1));
     int L = static_cast<int>(h.size(2));
-    int T = static_cast<int>(kc.size(1));
+    int K = static_cast<int>(kc.size(1));
     int N = static_cast<int>(kc.size(2));
-    int K = static_cast<int>(kc.size(3));
+    int T = static_cast<int>(kc.size(3));
 
     auto out = torch::empty(
         {B, D, T},
@@ -417,7 +414,7 @@ static torch::Tensor fdc_run_forward_direct_n6k3_d256_typed(
     int64_t off
 ) {
     int L = static_cast<int>(h.size(2));
-    int T = static_cast<int>(kc.size(1));
+    int T = static_cast<int>(kc.size(3));
 
     auto out = torch::empty(
         {1, 256, T},
@@ -477,7 +474,7 @@ static torch::Tensor fdc_run_forward_direct_n6k3_d512_typed(
     int64_t off
 ) {
     int L = static_cast<int>(h.size(2));
-    int T = static_cast<int>(kc.size(1));
+    int T = static_cast<int>(kc.size(3));
 
     auto out = torch::empty(
         {1, 512, T},

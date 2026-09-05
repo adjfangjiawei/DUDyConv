@@ -29,6 +29,9 @@ __global__ void fdc_mid_cast_float_to_scalar_kernel(
 
 // ======================================================================================
 // grad_h N6K3 shared by mid path, runtime D
+//
+// kc layout: [1,3,6,T]
+// kc[kk,n,t] = (kk * 6 + n) * T + t
 // ======================================================================================
 
 template <typename scalar_t>
@@ -67,15 +70,15 @@ __global__ void fdc_mid_n6k3_grad_h_kernel(
         int t = t0 + kk;
 
         if (t >= 0 && t < T) {
-            int64_t kb = static_cast<int64_t>(t) * 18 + kk;
+            int64_t kb = static_cast<int64_t>(kk) * 6 * T + t;
 
             float w =
-                fdc_to_float_dev(kc[kb + 0 * 3]) * m0 +
-                fdc_to_float_dev(kc[kb + 1 * 3]) * m1 +
-                fdc_to_float_dev(kc[kb + 2 * 3]) * m2 +
-                fdc_to_float_dev(kc[kb + 3 * 3]) * m3 +
-                fdc_to_float_dev(kc[kb + 4 * 3]) * m4 +
-                fdc_to_float_dev(kc[kb + 5 * 3]) * m5;
+                fdc_to_float_dev(kc[kb + 0 * T]) * m0 +
+                fdc_to_float_dev(kc[kb + 1 * T]) * m1 +
+                fdc_to_float_dev(kc[kb + 2 * T]) * m2 +
+                fdc_to_float_dev(kc[kb + 3 * T]) * m3 +
+                fdc_to_float_dev(kc[kb + 4 * T]) * m4 +
+                fdc_to_float_dev(kc[kb + 5 * T]) * m5;
 
             acc += fdc_to_float_dev(go[static_cast<int64_t>(d) * T + t]) * w;
         }
@@ -116,45 +119,45 @@ __global__ void fdc_mid_full4096_n6k3_grad_h_kernel(
 
     {
         int t = s;
-        int64_t kb = static_cast<int64_t>(t) * 18;
+        int64_t kb = static_cast<int64_t>(0) * 6 * 4096 + t;
 
         float w =
-            fdc_to_float_dev(kc[kb + 0]) * m0 +
-            fdc_to_float_dev(kc[kb + 3]) * m1 +
-            fdc_to_float_dev(kc[kb + 6]) * m2 +
-            fdc_to_float_dev(kc[kb + 9]) * m3 +
-            fdc_to_float_dev(kc[kb + 12]) * m4 +
-            fdc_to_float_dev(kc[kb + 15]) * m5;
+            fdc_to_float_dev(kc[kb + 0 * 4096]) * m0 +
+            fdc_to_float_dev(kc[kb + 1 * 4096]) * m1 +
+            fdc_to_float_dev(kc[kb + 2 * 4096]) * m2 +
+            fdc_to_float_dev(kc[kb + 3 * 4096]) * m3 +
+            fdc_to_float_dev(kc[kb + 4 * 4096]) * m4 +
+            fdc_to_float_dev(kc[kb + 5 * 4096]) * m5;
 
         acc += fdc_to_float_dev(go[static_cast<int64_t>(d) * 4096 + t]) * w;
     }
 
     if (s + 1 < 4096) {
         int t = s + 1;
-        int64_t kb = static_cast<int64_t>(t) * 18;
+        int64_t kb = static_cast<int64_t>(1) * 6 * 4096 + t;
 
         float w =
-            fdc_to_float_dev(kc[kb + 1]) * m0 +
-            fdc_to_float_dev(kc[kb + 4]) * m1 +
-            fdc_to_float_dev(kc[kb + 7]) * m2 +
-            fdc_to_float_dev(kc[kb + 10]) * m3 +
-            fdc_to_float_dev(kc[kb + 13]) * m4 +
-            fdc_to_float_dev(kc[kb + 16]) * m5;
+            fdc_to_float_dev(kc[kb + 0 * 4096]) * m0 +
+            fdc_to_float_dev(kc[kb + 1 * 4096]) * m1 +
+            fdc_to_float_dev(kc[kb + 2 * 4096]) * m2 +
+            fdc_to_float_dev(kc[kb + 3 * 4096]) * m3 +
+            fdc_to_float_dev(kc[kb + 4 * 4096]) * m4 +
+            fdc_to_float_dev(kc[kb + 5 * 4096]) * m5;
 
         acc += fdc_to_float_dev(go[static_cast<int64_t>(d) * 4096 + t]) * w;
     }
 
     if (s + 2 < 4096) {
         int t = s + 2;
-        int64_t kb = static_cast<int64_t>(t) * 18;
+        int64_t kb = static_cast<int64_t>(2) * 6 * 4096 + t;
 
         float w =
-            fdc_to_float_dev(kc[kb + 2]) * m0 +
-            fdc_to_float_dev(kc[kb + 5]) * m1 +
-            fdc_to_float_dev(kc[kb + 8]) * m2 +
-            fdc_to_float_dev(kc[kb + 11]) * m3 +
-            fdc_to_float_dev(kc[kb + 14]) * m4 +
-            fdc_to_float_dev(kc[kb + 17]) * m5;
+            fdc_to_float_dev(kc[kb + 0 * 4096]) * m0 +
+            fdc_to_float_dev(kc[kb + 1 * 4096]) * m1 +
+            fdc_to_float_dev(kc[kb + 2 * 4096]) * m2 +
+            fdc_to_float_dev(kc[kb + 3 * 4096]) * m3 +
+            fdc_to_float_dev(kc[kb + 4 * 4096]) * m4 +
+            fdc_to_float_dev(kc[kb + 5 * 4096]) * m5;
 
         acc += fdc_to_float_dev(go[static_cast<int64_t>(d) * 4096 + t]) * w;
     }
@@ -164,6 +167,8 @@ __global__ void fdc_mid_full4096_n6k3_grad_h_kernel(
 
 // ======================================================================================
 // grad_kernel mid warp, runtime D
+//
+// output gk layout: [1,3,6,T]
 // ======================================================================================
 
 template <typename scalar_t, int T_TILE>
@@ -221,19 +226,21 @@ __global__ void fdc_mid_n6k3_grad_kernel_warp_kernel(
     acc5 = fdc_warp_sum_float(acc5);
 
     if (lane == 0) {
-        int64_t base = static_cast<int64_t>(t) * 18;
+        int64_t base = static_cast<int64_t>(kk) * 6 * T + t;
 
-        gk[base + 0 * 3 + kk] = acc0;
-        gk[base + 1 * 3 + kk] = acc1;
-        gk[base + 2 * 3 + kk] = acc2;
-        gk[base + 3 * 3 + kk] = acc3;
-        gk[base + 4 * 3 + kk] = acc4;
-        gk[base + 5 * 3 + kk] = acc5;
+        gk[base + 0 * T] = acc0;
+        gk[base + 1 * T] = acc1;
+        gk[base + 2 * T] = acc2;
+        gk[base + 3 * T] = acc3;
+        gk[base + 4 * T] = acc4;
+        gk[base + 5 * T] = acc5;
     }
 }
 
 // ======================================================================================
 // grad_mix mid all n, runtime D
+//
+// kc layout: [1,3,6,T]
 // ======================================================================================
 
 template <typename scalar_t, int TILE_T>
@@ -281,14 +288,14 @@ __global__ void fdc_mid_n6k3_grad_mix_partial_alln_kernel(
                     g *
                     fdc_to_float_dev(h[static_cast<int64_t>(d) * L + s]);
 
-                int64_t kb = static_cast<int64_t>(t) * 18 + kk;
+                int64_t kb = static_cast<int64_t>(kk) * 6 * T + t;
 
-                acc0 += base * fdc_to_float_dev(kc[kb + 0 * 3]);
-                acc1 += base * fdc_to_float_dev(kc[kb + 1 * 3]);
-                acc2 += base * fdc_to_float_dev(kc[kb + 2 * 3]);
-                acc3 += base * fdc_to_float_dev(kc[kb + 3 * 3]);
-                acc4 += base * fdc_to_float_dev(kc[kb + 4 * 3]);
-                acc5 += base * fdc_to_float_dev(kc[kb + 5 * 3]);
+                acc0 += base * fdc_to_float_dev(kc[kb + 0 * T]);
+                acc1 += base * fdc_to_float_dev(kc[kb + 1 * T]);
+                acc2 += base * fdc_to_float_dev(kc[kb + 2 * T]);
+                acc3 += base * fdc_to_float_dev(kc[kb + 3 * T]);
+                acc4 += base * fdc_to_float_dev(kc[kb + 4 * T]);
+                acc5 += base * fdc_to_float_dev(kc[kb + 5 * T]);
             }
         }
     }
@@ -437,11 +444,11 @@ static std::vector<torch::Tensor> fdc_backward_mid_n6k3_warp_typed(
     int64_t off,
     bool full4096_offset0
 ) {
-    FDC_DEBUG_PATH("FDC path: backward_mid_n6k3_warp_d256_d512");
+    FDC_DEBUG_PATH("FDC path: backward_mid_n6k3_warp_d256_d512_bknt");
 
     int D = static_cast<int>(h.size(1));
     int L = static_cast<int>(h.size(2));
-    int T = static_cast<int>(kc.size(1));
+    int T = static_cast<int>(kc.size(3));
 
     TORCH_CHECK(
         D == 256 || D == 512,

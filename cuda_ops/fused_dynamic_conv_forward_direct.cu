@@ -27,7 +27,14 @@ enum class FDCForwardPlan : int {
     N32K3D256 = 7,
     N16K3D256 = 8,
     N64K3D256 = 9,
-    N128K3D256 = 10
+    N128K3D256 = 10,
+
+    // 新增方案：
+    // forward_n128_k3_d256_batched_sgemm
+    //
+    // 不替换旧 N128K3D256。
+    // 只是作为独立候选 plan 参与 warmup / cache / dispatch。
+    N128K3D256BatchedSgemm = 11
 };
 
 static inline const char* fdc_forward_plan_name_impl(FDCForwardPlan p) {
@@ -58,6 +65,9 @@ static inline const char* fdc_forward_plan_name_impl(FDCForwardPlan p) {
 
         case FDCForwardPlan::N128K3D256:
             return "forward_n128_k3_d256";
+
+        case FDCForwardPlan::N128K3D256BatchedSgemm:
+            return "forward_n128_k3_d256_batched_sgemm";
 
         default:
             return "unknown";
@@ -170,9 +180,9 @@ static inline FDCForwardCacheKey make_fdc_forward_cache_key(
     key.B = static_cast<int>(h.size(0));
     key.D = static_cast<int>(h.size(1));
     key.L = static_cast<int>(h.size(2));
-    key.T = static_cast<int>(kc.size(1));
+    key.K = static_cast<int>(kc.size(1));
     key.N = static_cast<int>(kc.size(2));
-    key.K = static_cast<int>(kc.size(3));
+    key.T = static_cast<int>(kc.size(3));
     key.off = static_cast<int>(off);
     key.dilation = static_cast<int>(dilation);
 
@@ -203,6 +213,7 @@ static inline void set_cached_fdc_forward_plan(
     FDCForwardPlan plan
 ) {
     std::lock_guard<std::mutex> lock(g_fdc_forward_plan_cache_mutex);
+
     g_fdc_forward_plan_cache[key] = plan;
 }
 
@@ -233,6 +244,7 @@ struct FDCForwardShapeInfo {
     bool n32k3d256;
     bool n64k3d256;
     bool n128k3d256;
+    bool n128k3d256_batched_sgemm;
     bool n6k3d512;
     bool smalln_preload;
 };
@@ -249,9 +261,9 @@ static inline FDCForwardShapeInfo make_fdc_forward_shape_info(
     s.B = static_cast<int>(h.size(0));
     s.D = static_cast<int>(h.size(1));
     s.L = static_cast<int>(h.size(2));
-    s.T = static_cast<int>(kc.size(1));
+    s.K = static_cast<int>(kc.size(1));
     s.N = static_cast<int>(kc.size(2));
-    s.K = static_cast<int>(kc.size(3));
+    s.T = static_cast<int>(kc.size(3));
     s.off = static_cast<int>(off);
     s.dilation = static_cast<int>(dilation);
     s.sm = fdc_forward_get_sm(h);
@@ -304,6 +316,17 @@ static inline FDCForwardShapeInfo make_fdc_forward_shape_info(
         s.is_fp32 &&
         s.T >= 512;
 
+    // 新增 batched SGEMM forward plan 的粗略 shape 标记。
+    // 真正可用性仍由 fdc_forward_n128_k3_d256_batched_sgemm_available_cuda 判断。
+    s.n128k3d256_batched_sgemm =
+        s.B == 1 &&
+        s.D == 256 &&
+        s.N == 128 &&
+        s.K == 3 &&
+        s.dil1 &&
+        s.is_fp32 &&
+        s.T >= 512;
+
     s.n6k3d512 =
         s.B == 1 &&
         s.D == 512 &&
@@ -340,7 +363,7 @@ static inline void check_fdc_forward_inputs(
     TORCH_CHECK(mix.is_contiguous(), "mix must be contiguous.");
 
     TORCH_CHECK(h.dim() == 3, "h must be [B,D,L].");
-    TORCH_CHECK(kc.dim() == 4, "kc must be [B,T,N,K].");
+    TORCH_CHECK(kc.dim() == 4, "kc must be [B,K,N,T].");
     TORCH_CHECK(mix.dim() == 2, "mix must be [D,N].");
 
     TORCH_CHECK(h.scalar_type() == kc.scalar_type(), "h/kc dtype mismatch.");
@@ -352,7 +375,7 @@ static inline void check_fdc_forward_inputs(
 
     TORCH_CHECK(off >= 0, "off must be >= 0.");
     TORCH_CHECK(dilation > 0, "dilation must be > 0.");
-    TORCH_CHECK(off + kc.size(1) <= h.size(2), "off + T must be <= L.");
+    TORCH_CHECK(off + kc.size(3) <= h.size(2), "off + T must be <= L.");
 
     TORCH_CHECK(
         h.scalar_type() == at::ScalarType::Float ||
@@ -424,6 +447,15 @@ static inline bool fdc_forward_plan_available(
 
         case FDCForwardPlan::N128K3D256:
             return fdc_forward_n128_k3_d256_available_cuda(
+                h,
+                kc,
+                mix,
+                off,
+                dilation
+            );
+
+        case FDCForwardPlan::N128K3D256BatchedSgemm:
+            return fdc_forward_n128_k3_d256_batched_sgemm_available_cuda(
                 h,
                 kc,
                 mix,
@@ -524,6 +556,14 @@ static torch::Tensor fdc_run_forward_plan(
                 off
             );
 
+        case FDCForwardPlan::N128K3D256BatchedSgemm:
+            return fdc_forward_n128_k3_d256_batched_sgemm_cuda(
+                h,
+                kc,
+                mix,
+                off
+            );
+
         case FDCForwardPlan::NewGemmNK3D256:
             return fdc_new_forward_gemm_nk3_d256_cuda(
                 h,
@@ -586,6 +626,26 @@ static FDCForwardPlan fdc_default_forward_plan(
         return FDCForwardPlan::N64K3D256;
     }
 
+    // 默认启发式中，把新增 batched SGEMM 放在旧 N128 前面。
+    //
+    // 注意：
+    //   这不是删除或修改旧 N128 plan。
+    //   只是当没有 warmup cache 时，N=128,K=3,D=256,fp32,dilation=1
+    //   会优先尝试新增方案。
+    //
+    // 如果你希望“默认不改变旧方案选择，只在 warmup 中被选择”，
+    // 可以删除这个 if，让它只出现在 candidate list。
+    if (s.n128k3d256_batched_sgemm &&
+        fdc_forward_n128_k3_d256_batched_sgemm_available_cuda(
+            h,
+            kc,
+            mix,
+            off,
+            dilation
+        )) {
+        return FDCForwardPlan::N128K3D256BatchedSgemm;
+    }
+
     if (s.n128k3d256 && fdc_forward_n128_k3_d256_available_cuda(
             h,
             kc,
@@ -638,6 +698,10 @@ static std::vector<FDCForwardPlan> fdc_all_candidate_forward_plans(
         FDCForwardPlan::N16K3D256,
         FDCForwardPlan::N32K3D256,
         FDCForwardPlan::N64K3D256,
+
+        // 新增 batched SGEMM 方案。
+        // 和旧 N128K3D256 都进入候选，由 warmup 实测选择。
+        FDCForwardPlan::N128K3D256BatchedSgemm,
         FDCForwardPlan::N128K3D256,
 
         FDCForwardPlan::DirectN6K3D256,
@@ -970,6 +1034,7 @@ int64_t fused_dynamic_conv_forward_direct_cached_plan_cuda(
 
 void fused_dynamic_conv_forward_direct_clear_warmup_cache_cuda() {
     std::lock_guard<std::mutex> lock(g_fdc_forward_plan_cache_mutex);
+
     g_fdc_forward_plan_cache.clear();
 }
 

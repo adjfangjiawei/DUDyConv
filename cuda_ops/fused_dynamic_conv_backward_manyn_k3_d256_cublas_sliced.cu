@@ -14,23 +14,23 @@
 // ======================================================================================
 // Backward many-N K3 D256 raw cuBLAS sliced plan
 //
-// K-slice formulation, no kc_flat, no gk_flat scatter:
+// kc layout is now:
+//
+//   kc: [1,3,N,T]
 //
 // For each kk:
 //
 //   x_dt[d,t] = go[d,t] * h[d, off+t-kk]
 //   x_td[t,d] = x_dt[d,t]
 //
-//   kc_tn[t,n] = kc[t,n,kk]
-//   kc_nt[n,t] = kc[t,n,kk]
+//   kc_tn[t,n] = kc[0,kk,n,t]
+//   kc_nt[n,t] = kc[0,kk,n,t]
 //
 //   w[d,t]    = mix[d,n] @ kc_nt[n,t]
 //   gh[d,s]  += go[d,t] * w[d,t], where s=off+t-kk
 //
-//   gk[t,n,kk] = x_td[t,d] @ mix[d,n]
-//   gm[d,n]   += x_dt[d,t] @ kc_tn[t,n]
-//
-// This replaces the previous at::matmul based many-N path with raw cuBLAS.
+//   gk[0,kk,n,t] = x_td[t,d] @ mix[d,n]
+//   gm[d,n]     += x_dt[d,t] @ kc_tn[t,n]
 // ======================================================================================
 
 static inline void fdc_check_cublas_sliced(cublasStatus_t status, const char* msg) {
@@ -169,7 +169,7 @@ __global__ void fdc_manyn_sliced_build_kc_float_kernel(
     int n = static_cast<int>(idx % N);
     int t = static_cast<int>(idx / N);
 
-    float v = kc[(static_cast<int64_t>(t) * N + n) * 3 + kk];
+    float v = kc[(static_cast<int64_t>(kk) * N + n) * T + t];
 
     kc_tn[static_cast<int64_t>(t) * N + n] = v;
     kc_nt[static_cast<int64_t>(n) * T + t] = v;
@@ -194,7 +194,9 @@ __global__ void fdc_manyn_sliced_build_kc_typed_kernel(
     int n = static_cast<int>(idx % N);
     int t = static_cast<int>(idx / N);
 
-    float v = fdc_to_float_dev(kc[(static_cast<int64_t>(t) * N + n) * 3 + kk]);
+    float v = fdc_to_float_dev(
+        kc[(static_cast<int64_t>(kk) * N + n) * T + t]
+    );
 
     kc_tn[static_cast<int64_t>(t) * N + n] = v;
     kc_nt[static_cast<int64_t>(n) * T + t] = v;
@@ -274,7 +276,7 @@ __global__ void fdc_manyn_sliced_write_gk_float_kernel(
     int n = static_cast<int>(idx % N);
     int t = static_cast<int>(idx / N);
 
-    gk[(static_cast<int64_t>(t) * N + n) * 3 + kk] =
+    gk[(static_cast<int64_t>(kk) * N + n) * T + t] =
         gk_tn[static_cast<int64_t>(t) * N + n];
 }
 
@@ -298,10 +300,10 @@ static std::vector<torch::Tensor> fdc_backward_manyn_k3_d256_cublas_sliced_float
     torch::Tensor mix,
     int64_t off
 ) {
-    FDC_DEBUG_PATH("FDC path: backward_manyn_k3_d256_cublas_sliced_float");
+    FDC_DEBUG_PATH("FDC path: backward_manyn_k3_d256_cublas_sliced_float_bknt");
 
     int L = static_cast<int>(h.size(2));
-    int T = static_cast<int>(kc.size(1));
+    int T = static_cast<int>(kc.size(3));
     int N = static_cast<int>(kc.size(2));
 
     auto fopts = h.options().dtype(torch::kFloat32);
@@ -437,7 +439,6 @@ static std::vector<torch::Tensor> fdc_backward_manyn_k3_d256_cublas_sliced_float
 
         C10_CUDA_KERNEL_LAUNCH_CHECK();
 
-        // w[256,T] = mix[256,N] @ kc_nt[N,T]
         fdc_sgemm_rowmajor_sliced(
             handle,
             mix.data_ptr<float>(),
@@ -466,7 +467,6 @@ static std::vector<torch::Tensor> fdc_backward_manyn_k3_d256_cublas_sliced_float
 
         C10_CUDA_KERNEL_LAUNCH_CHECK();
 
-        // gk_tn[T,N] = x_td[T,256] @ mix[256,N]
         fdc_sgemm_rowmajor_sliced(
             handle,
             x_td.data_ptr<float>(),
@@ -493,7 +493,6 @@ static std::vector<torch::Tensor> fdc_backward_manyn_k3_d256_cublas_sliced_float
 
         C10_CUDA_KERNEL_LAUNCH_CHECK();
 
-        // gm[256,N] += x_dt[256,T] @ kc_tn[T,N]
         fdc_sgemm_rowmajor_sliced(
             handle,
             x_dt.data_ptr<float>(),
@@ -521,10 +520,10 @@ static std::vector<torch::Tensor> fdc_backward_manyn_k3_d256_cublas_sliced_typed
     torch::Tensor mix,
     int64_t off
 ) {
-    FDC_DEBUG_PATH("FDC path: backward_manyn_k3_d256_cublas_sliced_typed");
+    FDC_DEBUG_PATH("FDC path: backward_manyn_k3_d256_cublas_sliced_typed_bknt");
 
     int L = static_cast<int>(h.size(2));
-    int T = static_cast<int>(kc.size(1));
+    int T = static_cast<int>(kc.size(3));
     int N = static_cast<int>(kc.size(2));
 
     auto fopts = h.options().dtype(torch::kFloat32);
@@ -805,6 +804,10 @@ bool fdc_backward_manyn_k3_d256_cublas_sliced_available_cuda(
         return false;
     }
 
+    if (!go.is_contiguous() || !h.is_contiguous() || !kc.is_contiguous() || !mix.is_contiguous()) {
+        return false;
+    }
+
     if (h.size(0) != 1 || go.size(0) != 1 || kc.size(0) != 1) {
         return false;
     }
@@ -813,7 +816,7 @@ bool fdc_backward_manyn_k3_d256_cublas_sliced_available_cuda(
         return false;
     }
 
-    if (kc.size(3) != 3) {
+    if (kc.size(1) != 3) {
         return false;
     }
 
@@ -821,7 +824,7 @@ bool fdc_backward_manyn_k3_d256_cublas_sliced_available_cuda(
         return false;
     }
 
-    if (go.size(2) != kc.size(1)) {
+    if (go.size(2) != kc.size(3)) {
         return false;
     }
 
@@ -833,11 +836,35 @@ bool fdc_backward_manyn_k3_d256_cublas_sliced_available_cuda(
         return false;
     }
 
-    if (kc.size(1) < 1024) {
+    if (kc.size(3) < 1024) {
         return false;
     }
 
     if (off < 0) {
+        return false;
+    }
+
+    if (off + kc.size(3) > h.size(2)) {
+        return false;
+    }
+
+    if (h.scalar_type() != go.scalar_type()) {
+        return false;
+    }
+
+    if (h.scalar_type() != kc.scalar_type()) {
+        return false;
+    }
+
+    if (h.scalar_type() != mix.scalar_type()) {
+        return false;
+    }
+
+    if (
+        h.scalar_type() != at::ScalarType::Float &&
+        h.scalar_type() != at::ScalarType::Half &&
+        h.scalar_type() != at::ScalarType::BFloat16
+    ) {
         return false;
     }
 
@@ -852,17 +879,17 @@ std::vector<torch::Tensor> fdc_backward_manyn_k3_d256_cublas_sliced_cuda(
     int64_t off
 ) {
     TORCH_CHECK(h.dim() == 3, "h must be [B,D,L].");
-    TORCH_CHECK(kc.dim() == 4, "kc must be [B,T,N,K].");
+    TORCH_CHECK(kc.dim() == 4, "kc must be [B,K,N,T].");
     TORCH_CHECK(mix.dim() == 2, "mix must be [D,N].");
     TORCH_CHECK(go.dim() == 3, "go must be [B,D,T].");
 
     TORCH_CHECK(h.size(0) == 1, "sliced manyn requires B == 1.");
     TORCH_CHECK(h.size(1) == 256, "sliced manyn requires D == 256.");
     TORCH_CHECK(go.size(1) == 256, "sliced manyn requires go D == 256.");
-    TORCH_CHECK(kc.size(3) == 3, "sliced manyn requires K == 3.");
+    TORCH_CHECK(kc.size(1) == 3, "sliced manyn requires K == 3.");
     TORCH_CHECK(mix.size(0) == 256, "sliced manyn requires mix D == 256.");
     TORCH_CHECK(mix.size(1) == kc.size(2), "mix N mismatch.");
-    TORCH_CHECK(go.size(2) == kc.size(1), "go T mismatch.");
+    TORCH_CHECK(go.size(2) == kc.size(3), "go T mismatch.");
 
     if (h.scalar_type() == at::ScalarType::Float) {
         return fdc_backward_manyn_k3_d256_cublas_sliced_float(
