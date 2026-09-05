@@ -1,53 +1,7 @@
-import os
 import torch
 import torch.nn as nn
 
-from torch.utils.cpp_extension import load
-
-
-_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-
-_EXT = None
-
-
-def _load_fused_dynamic_conv_ext():
-    global _EXT
-
-    if _EXT is not None:
-        return _EXT
-
-    cpp_path = os.path.join(
-        _THIS_DIR,
-        "fused_dynamic_conv.cpp",
-    )
-
-    cu_path = os.path.join(
-        _THIS_DIR,
-        "fused_dynamic_conv_kernel.cu",
-    )
-
-    extra_cuda_cflags = [
-        "-O3",
-        "--use_fast_math",
-        "-lineinfo",
-    ]
-
-    extra_cflags = [
-        "-O3",
-    ]
-
-    _EXT = load(
-        name="fused_dynamic_conv_ext",
-        sources=[
-            cpp_path,
-            cu_path,
-        ],
-        extra_cflags=extra_cflags,
-        extra_cuda_cflags=extra_cuda_cflags,
-        verbose=False,
-    )
-
-    return _EXT
+import cuda_ops_ext as _EXT
 
 
 class FusedDynamicConvChunkFunction(torch.autograd.Function):
@@ -73,16 +27,6 @@ class FusedDynamicConvChunkFunction(torch.autograd.Function):
     输出:
         out_chunk:
             [B,D,T]
-
-    公式:
-        global_t = t_offset + i
-
-        out[b,d,i] =
-            sum_k sum_n kernel_chunk[b,i,n,k]
-                    * kernel_mix[d,n]
-                    * h_full[b,d,global_t - k * dilation]
-
-        越界位置跳过。
     """
 
     @staticmethod
@@ -105,17 +49,27 @@ class FusedDynamicConvChunkFunction(torch.autograd.Function):
 
         if not h_full.is_cuda:
             raise RuntimeError("h_full must be CUDA tensor.")
+
         if not kernel_chunk.is_cuda:
             raise RuntimeError("kernel_chunk must be CUDA tensor.")
+
         if not kernel_mix.is_cuda:
             raise RuntimeError("kernel_mix must be CUDA tensor.")
 
         if h_full.dim() != 3:
-            raise RuntimeError(f"h_full must be [B,D,L], got {tuple(h_full.shape)}.")
+            raise RuntimeError(
+                f"h_full must be [B,D,L], got {tuple(h_full.shape)}."
+            )
+
         if kernel_chunk.dim() != 4:
-            raise RuntimeError(f"kernel_chunk must be [B,T,N,K], got {tuple(kernel_chunk.shape)}.")
+            raise RuntimeError(
+                f"kernel_chunk must be [B,T,N,K], got {tuple(kernel_chunk.shape)}."
+            )
+
         if kernel_mix.dim() != 2:
-            raise RuntimeError(f"kernel_mix must be [D,N], got {tuple(kernel_mix.shape)}.")
+            raise RuntimeError(
+                f"kernel_mix must be [D,N], got {tuple(kernel_mix.shape)}."
+            )
 
         B, D, L = h_full.shape
         Bk, T, N, K = kernel_chunk.shape
@@ -123,16 +77,22 @@ class FusedDynamicConvChunkFunction(torch.autograd.Function):
 
         if B != Bk:
             raise RuntimeError(f"B mismatch: h_full={B}, kernel_chunk={Bk}.")
+
         if D != Dm:
             raise RuntimeError(f"D mismatch: h_full={D}, kernel_mix={Dm}.")
+
         if N != Nm:
             raise RuntimeError(f"N mismatch: kernel_chunk={N}, kernel_mix={Nm}.")
+
         if T <= 0:
             raise RuntimeError("T must be positive.")
+
         if K <= 0:
             raise RuntimeError("K must be positive.")
+
         if t_offset < 0:
             raise RuntimeError("t_offset must be non-negative.")
+
         if t_offset + T > L:
             raise RuntimeError(
                 f"t_offset + T must be <= L, got t_offset={t_offset}, T={T}, L={L}."
@@ -147,6 +107,7 @@ class FusedDynamicConvChunkFunction(torch.autograd.Function):
 
         if kernel_chunk.dtype != h_full.dtype:
             raise RuntimeError("kernel_chunk dtype must equal h_full dtype.")
+
         if kernel_mix.dtype != h_full.dtype:
             raise RuntimeError("kernel_mix dtype must equal h_full dtype.")
 
@@ -154,9 +115,7 @@ class FusedDynamicConvChunkFunction(torch.autograd.Function):
         kernel_chunk_c = kernel_chunk.contiguous()
         kernel_mix_c = kernel_mix.contiguous()
 
-        ext = _load_fused_dynamic_conv_ext()
-
-        out = ext.forward_chunk(
+        out = _EXT.forward_chunk(
             h_full_c,
             kernel_chunk_c,
             kernel_mix_c,
@@ -187,9 +146,7 @@ class FusedDynamicConvChunkFunction(torch.autograd.Function):
 
         grad_out_c = grad_out.contiguous()
 
-        ext = _load_fused_dynamic_conv_ext()
-
-        grad_h_full, grad_kernel_chunk, grad_kernel_mix = ext.backward_chunk(
+        grad_h_full, grad_kernel_chunk, grad_kernel_mix = _EXT.backward_chunk(
             grad_out_c,
             h_full,
             kernel_chunk,
@@ -205,6 +162,87 @@ class FusedDynamicConvChunkFunction(torch.autograd.Function):
             None,
             None,
         )
+
+
+def _check_forward_inputs(
+    h_full: torch.Tensor,
+    kernel_chunk: torch.Tensor,
+    kernel_mix: torch.Tensor,
+    t_offset: int,
+    dilation: int,
+) -> None:
+    if not isinstance(t_offset, int):
+        t_offset = int(t_offset)
+
+    if not isinstance(dilation, int):
+        dilation = int(dilation)
+
+    if dilation <= 0:
+        raise RuntimeError("dilation must be positive.")
+
+    if not h_full.is_cuda:
+        raise RuntimeError("h_full must be CUDA tensor.")
+
+    if not kernel_chunk.is_cuda:
+        raise RuntimeError("kernel_chunk must be CUDA tensor.")
+
+    if not kernel_mix.is_cuda:
+        raise RuntimeError("kernel_mix must be CUDA tensor.")
+
+    if h_full.dim() != 3:
+        raise RuntimeError(
+            f"h_full must be [B,D,L], got {tuple(h_full.shape)}."
+        )
+
+    if kernel_chunk.dim() != 4:
+        raise RuntimeError(
+            f"kernel_chunk must be [B,T,N,K], got {tuple(kernel_chunk.shape)}."
+        )
+
+    if kernel_mix.dim() != 2:
+        raise RuntimeError(
+            f"kernel_mix must be [D,N], got {tuple(kernel_mix.shape)}."
+        )
+
+    B, D, L = h_full.shape
+    Bk, T, N, K = kernel_chunk.shape
+    Dm, Nm = kernel_mix.shape
+
+    if B != Bk:
+        raise RuntimeError(f"B mismatch: h_full={B}, kernel_chunk={Bk}.")
+
+    if D != Dm:
+        raise RuntimeError(f"D mismatch: h_full={D}, kernel_mix={Dm}.")
+
+    if N != Nm:
+        raise RuntimeError(f"N mismatch: kernel_chunk={N}, kernel_mix={Nm}.")
+
+    if T <= 0:
+        raise RuntimeError("T must be positive.")
+
+    if K <= 0:
+        raise RuntimeError("K must be positive.")
+
+    if t_offset < 0:
+        raise RuntimeError("t_offset must be non-negative.")
+
+    if t_offset + T > L:
+        raise RuntimeError(
+            f"t_offset + T must be <= L, got t_offset={t_offset}, T={T}, L={L}."
+        )
+
+    if h_full.dtype not in (
+        torch.float32,
+        torch.float16,
+        torch.bfloat16,
+    ):
+        raise RuntimeError(f"Unsupported dtype: {h_full.dtype}.")
+
+    if kernel_chunk.dtype != h_full.dtype:
+        raise RuntimeError("kernel_chunk dtype must equal h_full dtype.")
+
+    if kernel_mix.dtype != h_full.dtype:
+        raise RuntimeError("kernel_mix dtype must equal h_full dtype.")
 
 
 def fused_dynamic_conv_chunk(
@@ -223,64 +261,6 @@ def fused_dynamic_conv_chunk(
     )
 
 
-class FusedDynamicConvFunction(torch.autograd.Function):
-    """
-    整段版本包装。
-
-    等价于:
-        fused_dynamic_conv_chunk(
-            h_full=h,
-            kernel_chunk=kernel,
-            kernel_mix=kernel_mix,
-            t_offset=0,
-            dilation=dilation,
-        )
-
-    输入:
-        h:
-            [B,D,L]
-
-        kernel:
-            [B,L,N,K]
-
-        kernel_mix:
-            [D,N]
-
-    输出:
-        [B,D,L]
-    """
-
-    @staticmethod
-    def forward(
-        ctx,
-        h,
-        kernel,
-        kernel_mix,
-        dilation: int = 1,
-    ):
-        out = FusedDynamicConvChunkFunction.apply(
-            h,
-            kernel,
-            kernel_mix,
-            0,
-            int(dilation),
-        )
-
-        ctx.dilation = int(dilation)
-
-        return out
-
-    @staticmethod
-    def backward(
-        ctx,
-        grad_out,
-    ):
-        raise RuntimeError(
-            "Internal error: FusedDynamicConvFunction should not receive backward directly. "
-            "Use fused_dynamic_conv_chunk or fused_dynamic_conv."
-        )
-
-
 def fused_dynamic_conv(
     h: torch.Tensor,
     kernel: torch.Tensor,
@@ -296,30 +276,416 @@ def fused_dynamic_conv(
     )
 
 
+def fused_dynamic_conv_forward_warmup_chunk(
+    h_full: torch.Tensor,
+    kernel_chunk: torch.Tensor,
+    kernel_mix: torch.Tensor,
+    t_offset: int,
+    dilation: int = 1,
+    repeat: int = 3,
+) -> int:
+    if not isinstance(t_offset, int):
+        t_offset = int(t_offset)
+
+    if not isinstance(dilation, int):
+        dilation = int(dilation)
+
+    if not isinstance(repeat, int):
+        repeat = int(repeat)
+
+    if repeat <= 0:
+        raise RuntimeError("repeat must be positive.")
+
+    _check_forward_inputs(
+        h_full=h_full,
+        kernel_chunk=kernel_chunk,
+        kernel_mix=kernel_mix,
+        t_offset=int(t_offset),
+        dilation=int(dilation),
+    )
+
+    plan_id = _EXT.forward_chunk_warmup(
+        h_full.contiguous(),
+        kernel_chunk.contiguous(),
+        kernel_mix.contiguous(),
+        int(t_offset),
+        int(dilation),
+        int(repeat),
+    )
+
+    return int(plan_id)
+
+
+def fused_dynamic_conv_forward_warmup(
+    h: torch.Tensor,
+    kernel: torch.Tensor,
+    kernel_mix: torch.Tensor,
+    dilation: int = 1,
+    repeat: int = 3,
+) -> int:
+    return fused_dynamic_conv_forward_warmup_chunk(
+        h_full=h,
+        kernel_chunk=kernel,
+        kernel_mix=kernel_mix,
+        t_offset=0,
+        dilation=int(dilation),
+        repeat=int(repeat),
+    )
+
+
+def fused_dynamic_conv_forward_cached_plan_chunk(
+    h_full: torch.Tensor,
+    kernel_chunk: torch.Tensor,
+    kernel_mix: torch.Tensor,
+    t_offset: int,
+    dilation: int = 1,
+) -> int:
+    if not isinstance(t_offset, int):
+        t_offset = int(t_offset)
+
+    if not isinstance(dilation, int):
+        dilation = int(dilation)
+
+    _check_forward_inputs(
+        h_full=h_full,
+        kernel_chunk=kernel_chunk,
+        kernel_mix=kernel_mix,
+        t_offset=int(t_offset),
+        dilation=int(dilation),
+    )
+
+    return int(
+        _EXT.forward_chunk_cached_plan(
+            h_full.contiguous(),
+            kernel_chunk.contiguous(),
+            kernel_mix.contiguous(),
+            int(t_offset),
+            int(dilation),
+        )
+    )
+
+
+def fused_dynamic_conv_forward_cached_plan(
+    h: torch.Tensor,
+    kernel: torch.Tensor,
+    kernel_mix: torch.Tensor,
+    dilation: int = 1,
+) -> int:
+    return fused_dynamic_conv_forward_cached_plan_chunk(
+        h_full=h,
+        kernel_chunk=kernel,
+        kernel_mix=kernel_mix,
+        t_offset=0,
+        dilation=int(dilation),
+    )
+
+
+def fused_dynamic_conv_forward_clear_warmup_cache() -> None:
+    _EXT.forward_chunk_clear_warmup_cache()
+
+
+def fused_dynamic_conv_forward_plan_name(plan_id: int) -> str:
+    plan_id = int(plan_id)
+
+    try:
+        return str(_EXT.forward_plan_name(plan_id))
+    except Exception:
+        names = {
+            -1: "not_cached",
+            0: "forward_direct_generic_2d",
+            1: "forward_direct_generic_smalln_preload",
+            2: "forward_direct_n6k3_d256",
+            3: "forward_direct_n16k3_d256",
+            4: "forward_direct_n6k7_d256",
+            5: "forward_direct_n6k3_d512",
+            6: "forward_new_gemm_nk3_d256",
+        }
+
+        return names.get(plan_id, f"unknown_forward_plan_{plan_id}")
+
+
+def fused_dynamic_conv_backward_warmup_chunk(
+    grad_out: torch.Tensor,
+    h_full: torch.Tensor,
+    kernel_chunk: torch.Tensor,
+    kernel_mix: torch.Tensor,
+    t_offset: int,
+    dilation: int = 1,
+    repeat: int = 3,
+) -> int:
+    if not isinstance(t_offset, int):
+        t_offset = int(t_offset)
+
+    if not isinstance(dilation, int):
+        dilation = int(dilation)
+
+    if not isinstance(repeat, int):
+        repeat = int(repeat)
+
+    if dilation <= 0:
+        raise RuntimeError("dilation must be positive.")
+
+    if repeat <= 0:
+        raise RuntimeError("repeat must be positive.")
+
+    if not grad_out.is_cuda:
+        raise RuntimeError("grad_out must be CUDA tensor.")
+
+    if not h_full.is_cuda:
+        raise RuntimeError("h_full must be CUDA tensor.")
+
+    if not kernel_chunk.is_cuda:
+        raise RuntimeError("kernel_chunk must be CUDA tensor.")
+
+    if not kernel_mix.is_cuda:
+        raise RuntimeError("kernel_mix must be CUDA tensor.")
+
+    if h_full.dim() != 3:
+        raise RuntimeError(
+            f"h_full must be [B,D,L], got {tuple(h_full.shape)}."
+        )
+
+    if kernel_chunk.dim() != 4:
+        raise RuntimeError(
+            f"kernel_chunk must be [B,T,N,K], got {tuple(kernel_chunk.shape)}."
+        )
+
+    if kernel_mix.dim() != 2:
+        raise RuntimeError(
+            f"kernel_mix must be [D,N], got {tuple(kernel_mix.shape)}."
+        )
+
+    if grad_out.dim() != 3:
+        raise RuntimeError(
+            f"grad_out must be [B,D,T], got {tuple(grad_out.shape)}."
+        )
+
+    B, D, L = h_full.shape
+    Bk, T, N, K = kernel_chunk.shape
+    Dm, Nm = kernel_mix.shape
+
+    if B != Bk:
+        raise RuntimeError(f"B mismatch: h_full={B}, kernel_chunk={Bk}.")
+
+    if D != Dm:
+        raise RuntimeError(f"D mismatch: h_full={D}, kernel_mix={Dm}.")
+
+    if N != Nm:
+        raise RuntimeError(f"N mismatch: kernel_chunk={N}, kernel_mix={Nm}.")
+
+    if grad_out.shape[0] != B:
+        raise RuntimeError(
+            f"grad_out B mismatch: grad_out={grad_out.shape[0]}, h_full={B}."
+        )
+
+    if grad_out.shape[1] != D:
+        raise RuntimeError(
+            f"grad_out D mismatch: grad_out={grad_out.shape[1]}, h_full={D}."
+        )
+
+    if grad_out.shape[2] != T:
+        raise RuntimeError(
+            f"grad_out T mismatch: grad_out={grad_out.shape[2]}, kernel_chunk={T}."
+        )
+
+    if T <= 0:
+        raise RuntimeError("T must be positive.")
+
+    if K <= 0:
+        raise RuntimeError("K must be positive.")
+
+    if t_offset < 0:
+        raise RuntimeError("t_offset must be non-negative.")
+
+    if t_offset + T > L:
+        raise RuntimeError(
+            f"t_offset + T must be <= L, got t_offset={t_offset}, T={T}, L={L}."
+        )
+
+    if h_full.dtype not in (
+        torch.float32,
+        torch.float16,
+        torch.bfloat16,
+    ):
+        raise RuntimeError(f"Unsupported dtype: {h_full.dtype}.")
+
+    if grad_out.dtype != h_full.dtype:
+        raise RuntimeError("grad_out dtype must equal h_full dtype.")
+
+    if kernel_chunk.dtype != h_full.dtype:
+        raise RuntimeError("kernel_chunk dtype must equal h_full dtype.")
+
+    if kernel_mix.dtype != h_full.dtype:
+        raise RuntimeError("kernel_mix dtype must equal h_full dtype.")
+
+    plan_id = _EXT.backward_chunk_warmup(
+        grad_out.contiguous(),
+        h_full.contiguous(),
+        kernel_chunk.contiguous(),
+        kernel_mix.contiguous(),
+        int(t_offset),
+        int(dilation),
+        int(repeat),
+    )
+
+    return int(plan_id)
+
+
+def fused_dynamic_conv_backward_warmup(
+    grad_out: torch.Tensor,
+    h: torch.Tensor,
+    kernel: torch.Tensor,
+    kernel_mix: torch.Tensor,
+    dilation: int = 1,
+    repeat: int = 3,
+) -> int:
+    return fused_dynamic_conv_backward_warmup_chunk(
+        grad_out=grad_out,
+        h_full=h,
+        kernel_chunk=kernel,
+        kernel_mix=kernel_mix,
+        t_offset=0,
+        dilation=int(dilation),
+        repeat=int(repeat),
+    )
+
+
+def fused_dynamic_conv_backward_cached_plan_chunk(
+    h_full: torch.Tensor,
+    kernel_chunk: torch.Tensor,
+    t_offset: int,
+    dilation: int = 1,
+) -> int:
+    if not isinstance(t_offset, int):
+        t_offset = int(t_offset)
+
+    if not isinstance(dilation, int):
+        dilation = int(dilation)
+
+    if dilation <= 0:
+        raise RuntimeError("dilation must be positive.")
+
+    if not h_full.is_cuda:
+        raise RuntimeError("h_full must be CUDA tensor.")
+
+    if not kernel_chunk.is_cuda:
+        raise RuntimeError("kernel_chunk must be CUDA tensor.")
+
+    if h_full.dim() != 3:
+        raise RuntimeError(
+            f"h_full must be [B,D,L], got {tuple(h_full.shape)}."
+        )
+
+    if kernel_chunk.dim() != 4:
+        raise RuntimeError(
+            f"kernel_chunk must be [B,T,N,K], got {tuple(kernel_chunk.shape)}."
+        )
+
+    B, D, L = h_full.shape
+    Bk, T, N, K = kernel_chunk.shape
+
+    if B != Bk:
+        raise RuntimeError(f"B mismatch: h_full={B}, kernel_chunk={Bk}.")
+
+    if T <= 0:
+        raise RuntimeError("T must be positive.")
+
+    if K <= 0:
+        raise RuntimeError("K must be positive.")
+
+    if t_offset < 0:
+        raise RuntimeError("t_offset must be non-negative.")
+
+    if t_offset + T > L:
+        raise RuntimeError(
+            f"t_offset + T must be <= L, got t_offset={t_offset}, T={T}, L={L}."
+        )
+
+    if h_full.dtype not in (
+        torch.float32,
+        torch.float16,
+        torch.bfloat16,
+    ):
+        raise RuntimeError(f"Unsupported dtype: {h_full.dtype}.")
+
+    if kernel_chunk.dtype != h_full.dtype:
+        raise RuntimeError("kernel_chunk dtype must equal h_full dtype.")
+
+    return int(
+        _EXT.backward_chunk_cached_plan(
+            h_full.contiguous(),
+            kernel_chunk.contiguous(),
+            int(t_offset),
+            int(dilation),
+        )
+    )
+
+
+def fused_dynamic_conv_backward_cached_plan(
+    h: torch.Tensor,
+    kernel: torch.Tensor,
+    dilation: int = 1,
+) -> int:
+    return fused_dynamic_conv_backward_cached_plan_chunk(
+        h_full=h,
+        kernel_chunk=kernel,
+        t_offset=0,
+        dilation=int(dilation),
+    )
+
+
+def fused_dynamic_conv_backward_clear_warmup_cache() -> None:
+    _EXT.backward_chunk_clear_warmup_cache()
+
+
+def fused_dynamic_conv_backward_plan_name(plan_id: int) -> str:
+    plan_id = int(plan_id)
+
+    try:
+        return str(_EXT.backward_plan_name(plan_id))
+    except Exception:
+        names = {
+            -1: "not_cached",
+            0: "backward_small_n6k3",
+            1: "backward_mid_n6k3_warp",
+            2: "backward_base_n6k3",
+            3: "backward_base_n16k3",
+            4: "backward_large",
+            5: "backward_fp16_gemmex_v3",
+            6: "backward_new_gemm_nk3_d256",
+        }
+
+        return names.get(plan_id, f"unknown_plan_{plan_id}")
+
+
+class FusedDynamicConvFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        h,
+        kernel,
+        kernel_mix,
+        dilation: int = 1,
+    ):
+        return fused_dynamic_conv_chunk(
+            h_full=h,
+            kernel_chunk=kernel,
+            kernel_mix=kernel_mix,
+            t_offset=0,
+            dilation=int(dilation),
+        )
+
+    @staticmethod
+    def backward(
+        ctx,
+        grad_out,
+    ):
+        raise RuntimeError(
+            "Internal error: FusedDynamicConvFunction should not receive backward directly."
+        )
+
+
 class FusedDynamicConvChunk1d(nn.Module):
-    """
-    带 offset 的 nn.Module 包装。
-
-    这个类持有 kernel_mix 参数。
-
-    forward:
-        h_full:
-            [B,D,L]
-
-        kernel_chunk:
-            [B,T,N,K]
-
-        t_offset:
-            int
-
-        dilation:
-            int
-
-    return:
-        out_chunk:
-            [B,D,T]
-    """
-
     def __init__(
         self,
         embed_dim: int,
@@ -338,6 +704,7 @@ class FusedDynamicConvChunk1d(nn.Module):
 
         if self.embed_dim <= 0:
             raise ValueError("embed_dim must be positive.")
+
         if self.num_kernels <= 0:
             raise ValueError("num_kernels must be positive.")
 
@@ -372,6 +739,92 @@ class FusedDynamicConvChunk1d(nn.Module):
                 "bias",
                 None,
             )
+
+    def warmup_forward(
+        self,
+        h_full: torch.Tensor,
+        kernel_chunk: torch.Tensor,
+        t_offset: int,
+        dilation: int = 1,
+        repeat: int = 3,
+    ) -> int:
+        kernel_mix = self.kernel_mix
+
+        if kernel_mix.dtype != h_full.dtype:
+            kernel_mix = kernel_mix.to(
+                dtype=h_full.dtype,
+            )
+
+        return fused_dynamic_conv_forward_warmup_chunk(
+            h_full=h_full,
+            kernel_chunk=kernel_chunk,
+            kernel_mix=kernel_mix,
+            t_offset=int(t_offset),
+            dilation=int(dilation),
+            repeat=int(repeat),
+        )
+
+    def cached_forward_plan(
+        self,
+        h_full: torch.Tensor,
+        kernel_chunk: torch.Tensor,
+        t_offset: int,
+        dilation: int = 1,
+    ) -> int:
+        kernel_mix = self.kernel_mix
+
+        if kernel_mix.dtype != h_full.dtype:
+            kernel_mix = kernel_mix.to(
+                dtype=h_full.dtype,
+            )
+
+        return fused_dynamic_conv_forward_cached_plan_chunk(
+            h_full=h_full,
+            kernel_chunk=kernel_chunk,
+            kernel_mix=kernel_mix,
+            t_offset=int(t_offset),
+            dilation=int(dilation),
+        )
+
+    def warmup_backward(
+        self,
+        grad_out: torch.Tensor,
+        h_full: torch.Tensor,
+        kernel_chunk: torch.Tensor,
+        t_offset: int,
+        dilation: int = 1,
+        repeat: int = 3,
+    ) -> int:
+        kernel_mix = self.kernel_mix
+
+        if kernel_mix.dtype != h_full.dtype:
+            kernel_mix = kernel_mix.to(
+                dtype=h_full.dtype,
+            )
+
+        return fused_dynamic_conv_backward_warmup_chunk(
+            grad_out=grad_out,
+            h_full=h_full,
+            kernel_chunk=kernel_chunk,
+            kernel_mix=kernel_mix,
+            t_offset=int(t_offset),
+            dilation=int(dilation),
+            repeat=int(repeat),
+        )
+
+    def cached_backward_plan(
+        self,
+        h_full: torch.Tensor,
+        kernel_chunk: torch.Tensor,
+        t_offset: int,
+        dilation: int = 1,
+    ) -> int:
+        return fused_dynamic_conv_backward_cached_plan_chunk(
+            h_full=h_full,
+            kernel_chunk=kernel_chunk,
+            t_offset=int(t_offset),
+            dilation=int(dilation),
+        )
 
     def forward(
         self,
@@ -409,23 +862,63 @@ class FusedDynamicConvChunk1d(nn.Module):
 
 
 class FusedDynamicConv1d(FusedDynamicConvChunk1d):
-    """
-    整段版本 nn.Module。
+    def warmup_forward(
+        self,
+        h: torch.Tensor,
+        kernel: torch.Tensor,
+        dilation: int = 1,
+        repeat: int = 3,
+    ) -> int:
+        return super().warmup_forward(
+            h_full=h,
+            kernel_chunk=kernel,
+            t_offset=0,
+            dilation=int(dilation),
+            repeat=int(repeat),
+        )
 
-    forward:
-        h:
-            [B,D,L]
+    def cached_forward_plan(
+        self,
+        h: torch.Tensor,
+        kernel: torch.Tensor,
+        dilation: int = 1,
+    ) -> int:
+        return super().cached_forward_plan(
+            h_full=h,
+            kernel_chunk=kernel,
+            t_offset=0,
+            dilation=int(dilation),
+        )
 
-        kernel:
-            [B,L,N,K]
+    def warmup_backward(
+        self,
+        grad_out: torch.Tensor,
+        h: torch.Tensor,
+        kernel: torch.Tensor,
+        dilation: int = 1,
+        repeat: int = 3,
+    ) -> int:
+        return super().warmup_backward(
+            grad_out=grad_out,
+            h_full=h,
+            kernel_chunk=kernel,
+            t_offset=0,
+            dilation=int(dilation),
+            repeat=int(repeat),
+        )
 
-        dilation:
-            int
-
-    return:
-        out:
-            [B,D,L]
-    """
+    def cached_backward_plan(
+        self,
+        h: torch.Tensor,
+        kernel: torch.Tensor,
+        dilation: int = 1,
+    ) -> int:
+        return super().cached_backward_plan(
+            h_full=h,
+            kernel_chunk=kernel,
+            t_offset=0,
+            dilation=int(dilation),
+        )
 
     def forward(
         self,

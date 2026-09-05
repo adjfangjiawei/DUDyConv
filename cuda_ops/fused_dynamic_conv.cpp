@@ -1,114 +1,101 @@
 #include <torch/extension.h>
+
+#include <string>
 #include <vector>
 
-torch::Tensor fused_dynamic_conv_forward_chunk_cuda(torch::Tensor h_full,
-                                                    torch::Tensor kernel_chunk,
-                                                    torch::Tensor kernel_mix,
-                                                    int64_t t_offset,
+// ======================================================================================
+// CUDA functions implemented in fused_dynamic_conv_kernel.cu
+// ======================================================================================
+
+torch::Tensor fused_dynamic_conv_forward_chunk_cuda(torch::Tensor h,
+                                                    torch::Tensor kc,
+                                                    torch::Tensor mix,
+                                                    int64_t off,
                                                     int64_t dilation);
 
-std::vector<torch::Tensor> fused_dynamic_conv_backward_chunk_cuda(
-    torch::Tensor grad_out, torch::Tensor h_full, torch::Tensor kernel_chunk,
-    torch::Tensor kernel_mix, int64_t t_offset, int64_t dilation);
+std::vector<torch::Tensor>
+fused_dynamic_conv_backward_chunk_cuda(torch::Tensor go, torch::Tensor h,
+                                       torch::Tensor kc, torch::Tensor mix,
+                                       int64_t off, int64_t dilation);
 
-static void check_common_inputs(const torch::Tensor &h_full,
-                                const torch::Tensor &kernel_chunk,
-                                const torch::Tensor &kernel_mix,
-                                int64_t t_offset, int64_t dilation) {
-  TORCH_CHECK(h_full.is_cuda(), "h_full must be CUDA tensor.");
-  TORCH_CHECK(kernel_chunk.is_cuda(), "kernel_chunk must be CUDA tensor.");
-  TORCH_CHECK(kernel_mix.is_cuda(), "kernel_mix must be CUDA tensor.");
+int64_t fused_dynamic_conv_backward_chunk_warmup_cuda(
+    torch::Tensor go, torch::Tensor h, torch::Tensor kc, torch::Tensor mix,
+    int64_t off, int64_t dilation, int64_t repeat);
 
-  TORCH_CHECK(h_full.is_contiguous(), "h_full must be contiguous.");
-  TORCH_CHECK(kernel_chunk.is_contiguous(), "kernel_chunk must be contiguous.");
-  TORCH_CHECK(kernel_mix.is_contiguous(), "kernel_mix must be contiguous.");
+int64_t fused_dynamic_conv_backward_chunk_cached_plan_cuda(torch::Tensor h,
+                                                           torch::Tensor kc,
+                                                           int64_t off,
+                                                           int64_t dilation);
 
-  TORCH_CHECK(h_full.dim() == 3, "h_full must be [B,D,L].");
-  TORCH_CHECK(kernel_chunk.dim() == 4, "kernel_chunk must be [B,T,N,K].");
-  TORCH_CHECK(kernel_mix.dim() == 2, "kernel_mix must be [D,N].");
+void fused_dynamic_conv_backward_chunk_clear_warmup_cache_cuda();
 
-  TORCH_CHECK(h_full.scalar_type() == torch::kFloat32 ||
-                  h_full.scalar_type() == torch::kFloat16 ||
-                  h_full.scalar_type() == torch::kBFloat16,
-              "h_full dtype must be float32, float16 or bfloat16.");
+std::string fused_dynamic_conv_backward_plan_name_cuda(int64_t plan_id);
 
-  TORCH_CHECK(kernel_chunk.scalar_type() == h_full.scalar_type(),
-              "kernel_chunk dtype must equal h_full dtype.");
+// ======================================================================================
+// Forward autotune functions implemented in
+// fused_dynamic_conv_forward_direct.cu
+// ======================================================================================
 
-  TORCH_CHECK(kernel_mix.scalar_type() == h_full.scalar_type(),
-              "kernel_mix dtype must equal h_full dtype.");
+int64_t
+fused_dynamic_conv_forward_direct_warmup_cuda(torch::Tensor h, torch::Tensor kc,
+                                              torch::Tensor mix, int64_t off,
+                                              int64_t dilation, int64_t repeat);
 
-  const auto B = h_full.size(0);
-  const auto D = h_full.size(1);
-  const auto L = h_full.size(2);
+int64_t fused_dynamic_conv_forward_direct_cached_plan_cuda(torch::Tensor h,
+                                                           torch::Tensor kc,
+                                                           torch::Tensor mix,
+                                                           int64_t off,
+                                                           int64_t dilation);
 
-  const auto Bk = kernel_chunk.size(0);
-  const auto T = kernel_chunk.size(1);
-  const auto N = kernel_chunk.size(2);
-  const auto K = kernel_chunk.size(3);
+void fused_dynamic_conv_forward_direct_clear_warmup_cache_cuda();
 
-  const auto Dm = kernel_mix.size(0);
-  const auto Nm = kernel_mix.size(1);
+std::string fused_dynamic_conv_forward_direct_plan_name_cuda(int64_t plan_id);
 
-  TORCH_CHECK(B > 0, "B must be positive.");
-  TORCH_CHECK(D > 0, "D must be positive.");
-  TORCH_CHECK(L > 0, "L must be positive.");
-  TORCH_CHECK(T > 0, "T must be positive.");
-  TORCH_CHECK(N > 0, "N must be positive.");
-  TORCH_CHECK(K > 0, "K must be positive.");
-
-  TORCH_CHECK(B == Bk, "B mismatch.");
-  TORCH_CHECK(D == Dm, "D mismatch.");
-  TORCH_CHECK(N == Nm, "N mismatch.");
-
-  TORCH_CHECK(t_offset >= 0, "t_offset must be non-negative.");
-  TORCH_CHECK(dilation > 0, "dilation must be positive.");
-  TORCH_CHECK(t_offset + T <= L, "t_offset + T must be <= L.");
-}
-
-static void check_backward_inputs(const torch::Tensor &grad_out,
-                                  const torch::Tensor &h_full,
-                                  const torch::Tensor &kernel_chunk,
-                                  const torch::Tensor &kernel_mix,
-                                  int64_t t_offset, int64_t dilation) {
-  check_common_inputs(h_full, kernel_chunk, kernel_mix, t_offset, dilation);
-
-  TORCH_CHECK(grad_out.is_cuda(), "grad_out must be CUDA tensor.");
-  TORCH_CHECK(grad_out.is_contiguous(), "grad_out must be contiguous.");
-  TORCH_CHECK(grad_out.dim() == 3, "grad_out must be [B,D,T].");
-  TORCH_CHECK(grad_out.scalar_type() == h_full.scalar_type(),
-              "grad_out dtype must equal h_full dtype.");
-
-  TORCH_CHECK(grad_out.size(0) == h_full.size(0), "grad_out B mismatch.");
-  TORCH_CHECK(grad_out.size(1) == h_full.size(1), "grad_out D mismatch.");
-  TORCH_CHECK(grad_out.size(2) == kernel_chunk.size(1), "grad_out T mismatch.");
-}
-
-torch::Tensor forward_chunk(torch::Tensor h_full, torch::Tensor kernel_chunk,
-                            torch::Tensor kernel_mix, int64_t t_offset,
-                            int64_t dilation) {
-  check_common_inputs(h_full, kernel_chunk, kernel_mix, t_offset, dilation);
-
-  return fused_dynamic_conv_forward_chunk_cuda(h_full, kernel_chunk, kernel_mix,
-                                               t_offset, dilation);
-}
-
-std::vector<torch::Tensor> backward_chunk(torch::Tensor grad_out,
-                                          torch::Tensor h_full,
-                                          torch::Tensor kernel_chunk,
-                                          torch::Tensor kernel_mix,
-                                          int64_t t_offset, int64_t dilation) {
-  check_backward_inputs(grad_out, h_full, kernel_chunk, kernel_mix, t_offset,
-                        dilation);
-
-  return fused_dynamic_conv_backward_chunk_cuda(grad_out, h_full, kernel_chunk,
-                                                kernel_mix, t_offset, dilation);
-}
+// ======================================================================================
+// Python bindings
+// ======================================================================================
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("forward_chunk", &forward_chunk,
-        "Fused dynamic convolution chunk forward with offset");
+  m.def("forward_chunk", &fused_dynamic_conv_forward_chunk_cuda,
+        "Fused dynamic convolution forward chunk CUDA", py::arg("h"),
+        py::arg("kc"), py::arg("mix"), py::arg("off"), py::arg("dilation"));
 
-  m.def("backward_chunk", &backward_chunk,
-        "Fused dynamic convolution chunk backward with cuBLAS GEMM in CUDA");
+  m.def("forward_chunk_warmup", &fused_dynamic_conv_forward_direct_warmup_cuda,
+        "Fused dynamic convolution forward chunk warmup/autotune CUDA",
+        py::arg("h"), py::arg("kc"), py::arg("mix"), py::arg("off"),
+        py::arg("dilation"), py::arg("repeat") = 3);
+
+  m.def("forward_chunk_cached_plan",
+        &fused_dynamic_conv_forward_direct_cached_plan_cuda,
+        "Get cached fused dynamic convolution forward plan CUDA", py::arg("h"),
+        py::arg("kc"), py::arg("mix"), py::arg("off"), py::arg("dilation"));
+
+  m.def("forward_chunk_clear_warmup_cache",
+        &fused_dynamic_conv_forward_direct_clear_warmup_cache_cuda,
+        "Clear fused dynamic convolution forward warmup/autotune cache CUDA");
+
+  m.def("forward_plan_name", &fused_dynamic_conv_forward_direct_plan_name_cuda,
+        "Get fused dynamic convolution forward plan name", py::arg("plan_id"));
+
+  m.def("backward_chunk", &fused_dynamic_conv_backward_chunk_cuda,
+        "Fused dynamic convolution backward chunk CUDA", py::arg("go"),
+        py::arg("h"), py::arg("kc"), py::arg("mix"), py::arg("off"),
+        py::arg("dilation"));
+
+  m.def("backward_chunk_warmup", &fused_dynamic_conv_backward_chunk_warmup_cuda,
+        "Fused dynamic convolution backward chunk warmup/autotune CUDA",
+        py::arg("go"), py::arg("h"), py::arg("kc"), py::arg("mix"),
+        py::arg("off"), py::arg("dilation"), py::arg("repeat") = 3);
+
+  m.def("backward_chunk_cached_plan",
+        &fused_dynamic_conv_backward_chunk_cached_plan_cuda,
+        "Get cached fused dynamic convolution backward plan CUDA", py::arg("h"),
+        py::arg("kc"), py::arg("off"), py::arg("dilation"));
+
+  m.def("backward_chunk_clear_warmup_cache",
+        &fused_dynamic_conv_backward_chunk_clear_warmup_cache_cuda,
+        "Clear fused dynamic convolution backward warmup/autotune cache CUDA");
+
+  m.def("backward_plan_name", &fused_dynamic_conv_backward_plan_name_cuda,
+        "Get fused dynamic convolution backward plan name", py::arg("plan_id"));
 }
