@@ -8,6 +8,7 @@
 #include <cublas_v2.h>
 #include <vector>
 #include <type_traits>
+#include <cstdlib>
 
 template <typename T>
 __device__ __forceinline__ float to_float_dev(T x) {
@@ -51,6 +52,18 @@ static inline void check_cublas(cublasStatus_t s, const char* msg) {
     TORCH_CHECK(s == CUBLAS_STATUS_SUCCESS, msg);
 }
 
+static inline bool fdc_debug_path_enabled() {
+    const char* v = std::getenv("FDC_DEBUG_PATH");
+    return v != nullptr && v[0] != '\0' && v[0] != '0';
+}
+
+#define FDC_DEBUG_PATH(msg) \
+    do { \
+        if (fdc_debug_path_enabled()) { \
+            TORCH_WARN(msg); \
+        } \
+    } while (0)
+
 __device__ __forceinline__ float warp_sum_float(float v) {
     unsigned mask = 0xffffffffu;
     v += __shfl_down_sync(mask, v, 16);
@@ -86,14 +99,13 @@ __global__ void forward_kernel(
     if (b >= B || d >= D || t >= T) return;
 
     float acc = 0.0f;
-    int gt = off + t;
     int64_t hbase = ((int64_t)b * D + d) * L;
     int64_t obase = ((int64_t)b * D + d) * T;
     int64_t kbase = ((int64_t)b * T + t) * N * K;
     int64_t mbase = (int64_t)d * N;
 
     for (int kk = 0; kk < K; ++kk) {
-        int s = gt - kk * dilation;
+        int s = off + t - kk * dilation;
         if (s < 0 || s >= L) continue;
 
         float w = 0.0f;
@@ -101,11 +113,55 @@ __global__ void forward_kernel(
             w += to_float_dev(kc[kbase + n * K + kk]) *
                  to_float_dev(mix[mbase + n]);
         }
-
         acc += w * to_float_dev(h[hbase + s]);
     }
 
     out[obase + t] = from_float_dev<scalar_t>(acc);
+}
+
+template <typename scalar_t>
+__global__ void forward_n6k3_d256_kernel(
+    const scalar_t* __restrict__ h,
+    const scalar_t* __restrict__ kc,
+    const scalar_t* __restrict__ mix,
+    scalar_t* __restrict__ out,
+    int L,
+    int T,
+    int off
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = 256 * T;
+    if (idx >= total) return;
+
+    int t = idx % T;
+    int d = idx / T;
+
+    float m0 = to_float_dev(mix[d * 6 + 0]);
+    float m1 = to_float_dev(mix[d * 6 + 1]);
+    float m2 = to_float_dev(mix[d * 6 + 2]);
+    float m3 = to_float_dev(mix[d * 6 + 3]);
+    float m4 = to_float_dev(mix[d * 6 + 4]);
+    float m5 = to_float_dev(mix[d * 6 + 5]);
+
+    float acc = 0.0f;
+
+#pragma unroll
+    for (int kk = 0; kk < 3; ++kk) {
+        int s = off + t - kk;
+        if (s >= 0 && s < L) {
+            int64_t kb = (int64_t)t * 18 + kk;
+            float w =
+                to_float_dev(kc[kb + 0 * 3]) * m0 +
+                to_float_dev(kc[kb + 1 * 3]) * m1 +
+                to_float_dev(kc[kb + 2 * 3]) * m2 +
+                to_float_dev(kc[kb + 3 * 3]) * m3 +
+                to_float_dev(kc[kb + 4 * 3]) * m4 +
+                to_float_dev(kc[kb + 5 * 3]) * m5;
+            acc += w * to_float_dev(h[(int64_t)d * L + s]);
+        }
+    }
+
+    out[(int64_t)d * T + t] = from_float_dev<scalar_t>(acc);
 }
 
 torch::Tensor fused_dynamic_conv_forward_chunk_cuda(
@@ -124,6 +180,33 @@ torch::Tensor fused_dynamic_conv_forward_chunk_cuda(
 
     auto out = torch::empty({B, D, T}, h.options());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    if (B == 1 && D == 256 && N == 6 && K == 3 && (int)dilation == 1) {
+        AT_DISPATCH_FLOATING_TYPES_AND2(
+            at::ScalarType::Half,
+            at::ScalarType::BFloat16,
+            h.scalar_type(),
+            "forward_n6k3_d256_kernel",
+            [&] {
+                forward_n6k3_d256_kernel<scalar_t><<<
+                    (256 * T + 255) / 256,
+                    256,
+                    0,
+                    stream
+                >>>(
+                    h.data_ptr<scalar_t>(),
+                    kc.data_ptr<scalar_t>(),
+                    mix.data_ptr<scalar_t>(),
+                    out.data_ptr<scalar_t>(),
+                    L,
+                    T,
+                    (int)off
+                );
+            }
+        );
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        return out;
+    }
 
     dim3 block(16, 16);
     dim3 grid((T + 15) / 16, (D + 15) / 16, B);
@@ -187,6 +270,53 @@ __global__ void make_mix_float_kernel(
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < total) mixf[i] = to_float_dev(mix[i]);
+}
+
+template <typename scalar_t>
+__global__ void make_mix_transpose_float_kernel(
+    const scalar_t* __restrict__ mix,
+    float* __restrict__ mixT,
+    int D,
+    int N
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = D * N;
+    if (idx >= total) return;
+
+    int n = idx % N;
+    int d = idx / N;
+    mixT[n * D + d] = to_float_dev(mix[d * N + n]);
+}
+
+template <typename scalar_t>
+__global__ void make_base_ktd_float_kernel(
+    const scalar_t* __restrict__ go,
+    const scalar_t* __restrict__ h,
+    float* __restrict__ base,
+    int D,
+    int L,
+    int T,
+    int K,
+    int off
+) {
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total = (int64_t)K * T * D;
+    if (idx >= total) return;
+
+    int d = idx % D;
+    int64_t q = idx / D;
+    int t = q % T;
+    int kk = q / T;
+
+    int s = off + t - kk;
+    float v = 0.0f;
+
+    if (s >= 0 && s < L) {
+        v = to_float_dev(go[(int64_t)d * T + t]) *
+            to_float_dev(h[(int64_t)d * L + s]);
+    }
+
+    base[((int64_t)kk * T + t) * D + d] = v;
 }
 
 template <typename scalar_t>
@@ -257,9 +387,10 @@ __global__ void copy_gk_kernel(
     dst[((int64_t)b * T + t) * N * K + n * K + kk] = src[i];
 }
 
-__global__ void copy_gk_half_kernel(
-    const c10::Half* __restrict__ src,
-    c10::Half* __restrict__ dst,
+template <typename scalar_t>
+__global__ void copy_gk_float_to_scalar_kernel(
+    const float* __restrict__ src,
+    scalar_t* __restrict__ dst,
     int B,
     int T,
     int N,
@@ -275,11 +406,12 @@ __global__ void copy_gk_half_kernel(
     int t = q % T;
     int b = q / T;
 
-    dst[((int64_t)b * T + t) * N * K + n * K + kk] = src[i];
+    dst[((int64_t)b * T + t) * N * K + n * K + kk] =
+        from_float_dev<scalar_t>(src[i]);
 }
 
 // ======================================================================================
-// Generic grad_h kernels
+// grad_h
 // ======================================================================================
 
 template <typename scalar_t>
@@ -402,10 +534,6 @@ __global__ void grad_h_materialized_kernel(
     );
 }
 
-// ======================================================================================
-// small N6K3 path for true small T, kept because T1024 / bf16 T4096 is successful
-// ======================================================================================
-
 template <typename scalar_t>
 __global__ void small_n6k3_grad_h_kernel(
     const scalar_t* __restrict__ go,
@@ -435,14 +563,14 @@ __global__ void small_n6k3_grad_h_kernel(
     for (int kk = 0; kk < 3; ++kk) {
         int t = t0 + kk;
         if (t >= 0 && t < T) {
-            int64_t kb = (int64_t)t * 18;
+            int64_t kb = (int64_t)t * 18 + kk;
             float w =
-                to_float_dev(kc[kb + 0 * 3 + kk]) * m0 +
-                to_float_dev(kc[kb + 1 * 3 + kk]) * m1 +
-                to_float_dev(kc[kb + 2 * 3 + kk]) * m2 +
-                to_float_dev(kc[kb + 3 * 3 + kk]) * m3 +
-                to_float_dev(kc[kb + 4 * 3 + kk]) * m4 +
-                to_float_dev(kc[kb + 5 * 3 + kk]) * m5;
+                to_float_dev(kc[kb + 0 * 3]) * m0 +
+                to_float_dev(kc[kb + 1 * 3]) * m1 +
+                to_float_dev(kc[kb + 2 * 3]) * m2 +
+                to_float_dev(kc[kb + 3 * 3]) * m3 +
+                to_float_dev(kc[kb + 4 * 3]) * m4 +
+                to_float_dev(kc[kb + 5 * 3]) * m5;
 
             acc += to_float_dev(go[(int64_t)d * T + t]) * w;
         }
@@ -450,6 +578,75 @@ __global__ void small_n6k3_grad_h_kernel(
 
     gh[(int64_t)d * L + s] = acc;
 }
+
+template <typename scalar_t>
+__global__ void full4096_n6k3_grad_h_kernel(
+    const scalar_t* __restrict__ go,
+    const scalar_t* __restrict__ kc,
+    const scalar_t* __restrict__ mix,
+    float* __restrict__ gh
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = 256 * 4096;
+    if (idx >= total) return;
+
+    int s = idx & 4095;
+    int d = idx >> 12;
+
+    float m0 = to_float_dev(mix[d * 6 + 0]);
+    float m1 = to_float_dev(mix[d * 6 + 1]);
+    float m2 = to_float_dev(mix[d * 6 + 2]);
+    float m3 = to_float_dev(mix[d * 6 + 3]);
+    float m4 = to_float_dev(mix[d * 6 + 4]);
+    float m5 = to_float_dev(mix[d * 6 + 5]);
+
+    float acc = 0.0f;
+
+    {
+        int t = s;
+        int64_t kb = (int64_t)t * 18;
+        float w =
+            to_float_dev(kc[kb + 0]) * m0 +
+            to_float_dev(kc[kb + 3]) * m1 +
+            to_float_dev(kc[kb + 6]) * m2 +
+            to_float_dev(kc[kb + 9]) * m3 +
+            to_float_dev(kc[kb + 12]) * m4 +
+            to_float_dev(kc[kb + 15]) * m5;
+        acc += to_float_dev(go[(int64_t)d * 4096 + t]) * w;
+    }
+
+    if (s + 1 < 4096) {
+        int t = s + 1;
+        int64_t kb = (int64_t)t * 18;
+        float w =
+            to_float_dev(kc[kb + 1]) * m0 +
+            to_float_dev(kc[kb + 4]) * m1 +
+            to_float_dev(kc[kb + 7]) * m2 +
+            to_float_dev(kc[kb + 10]) * m3 +
+            to_float_dev(kc[kb + 13]) * m4 +
+            to_float_dev(kc[kb + 16]) * m5;
+        acc += to_float_dev(go[(int64_t)d * 4096 + t]) * w;
+    }
+
+    if (s + 2 < 4096) {
+        int t = s + 2;
+        int64_t kb = (int64_t)t * 18;
+        float w =
+            to_float_dev(kc[kb + 2]) * m0 +
+            to_float_dev(kc[kb + 5]) * m1 +
+            to_float_dev(kc[kb + 8]) * m2 +
+            to_float_dev(kc[kb + 11]) * m3 +
+            to_float_dev(kc[kb + 14]) * m4 +
+            to_float_dev(kc[kb + 17]) * m5;
+        acc += to_float_dev(go[(int64_t)d * 4096 + t]) * w;
+    }
+
+    gh[(int64_t)d * 4096 + s] = acc;
+}
+
+// ======================================================================================
+// Old small N6 kernels
+// ======================================================================================
 
 template <typename scalar_t>
 __global__ void small_n6k3_grad_kernel_kernel(
@@ -580,73 +777,8 @@ __global__ void small_n6k3_grad_mix_finalize_kernel(
 }
 
 // ======================================================================================
-// New mid/full N6K3 warp optimized kernels
+// Mid N6 warp path
 // ======================================================================================
-
-template <typename scalar_t>
-__global__ void full4096_n6k3_grad_h_kernel(
-    const scalar_t* __restrict__ go,
-    const scalar_t* __restrict__ kc,
-    const scalar_t* __restrict__ mix,
-    float* __restrict__ gh
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = 256 * 4096;
-    if (idx >= total) return;
-
-    int s = idx & 4095;
-    int d = idx >> 12;
-
-    float m0 = to_float_dev(mix[d * 6 + 0]);
-    float m1 = to_float_dev(mix[d * 6 + 1]);
-    float m2 = to_float_dev(mix[d * 6 + 2]);
-    float m3 = to_float_dev(mix[d * 6 + 3]);
-    float m4 = to_float_dev(mix[d * 6 + 4]);
-    float m5 = to_float_dev(mix[d * 6 + 5]);
-
-    float acc = 0.0f;
-
-    {
-        int t = s;
-        int64_t kb = (int64_t)t * 18;
-        float w =
-            to_float_dev(kc[kb + 0]) * m0 +
-            to_float_dev(kc[kb + 3]) * m1 +
-            to_float_dev(kc[kb + 6]) * m2 +
-            to_float_dev(kc[kb + 9]) * m3 +
-            to_float_dev(kc[kb + 12]) * m4 +
-            to_float_dev(kc[kb + 15]) * m5;
-        acc += to_float_dev(go[(int64_t)d * 4096 + t]) * w;
-    }
-
-    if (s + 1 < 4096) {
-        int t = s + 1;
-        int64_t kb = (int64_t)t * 18;
-        float w =
-            to_float_dev(kc[kb + 1]) * m0 +
-            to_float_dev(kc[kb + 4]) * m1 +
-            to_float_dev(kc[kb + 7]) * m2 +
-            to_float_dev(kc[kb + 10]) * m3 +
-            to_float_dev(kc[kb + 13]) * m4 +
-            to_float_dev(kc[kb + 16]) * m5;
-        acc += to_float_dev(go[(int64_t)d * 4096 + t]) * w;
-    }
-
-    if (s + 2 < 4096) {
-        int t = s + 2;
-        int64_t kb = (int64_t)t * 18;
-        float w =
-            to_float_dev(kc[kb + 2]) * m0 +
-            to_float_dev(kc[kb + 5]) * m1 +
-            to_float_dev(kc[kb + 8]) * m2 +
-            to_float_dev(kc[kb + 11]) * m3 +
-            to_float_dev(kc[kb + 14]) * m4 +
-            to_float_dev(kc[kb + 17]) * m5;
-        acc += to_float_dev(go[(int64_t)d * 4096 + t]) * w;
-    }
-
-    gh[(int64_t)d * 4096 + s] = acc;
-}
 
 template <typename scalar_t, int T_TILE>
 __global__ void mid_n6k3_grad_kernel_warp_kernel(
@@ -743,6 +875,7 @@ __global__ void mid_n6k3_grad_mix_partial_alln_kernel(
             if (s >= 0 && s < L) {
                 float base = g * to_float_dev(h[(int64_t)d * L + s]);
                 int64_t kb = (int64_t)t * 18 + kk;
+
                 acc0 += base * to_float_dev(kc[kb + 0 * 3]);
                 acc1 += base * to_float_dev(kc[kb + 1 * 3]);
                 acc2 += base * to_float_dev(kc[kb + 2 * 3]);
@@ -878,7 +1011,346 @@ __global__ void mid_n6k3_grad_mix_finalize_alln_kernel(
 }
 
 // ======================================================================================
-// New mid N16K3 warp optimized kernels
+// Base-coalesced N6/N16 grad_kernel
+// ======================================================================================
+
+template <int T_TILE>
+__global__ void base_n6k3_grad_kernel_warp_kernel(
+    const float* __restrict__ base,
+    const float* __restrict__ mixT,
+    float* __restrict__ gk,
+    int D,
+    int T
+) {
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int t = blockIdx.x * T_TILE + warp;
+    int kk = blockIdx.y;
+
+    if (warp >= T_TILE || t >= T) return;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    float acc2 = 0.0f;
+    float acc3 = 0.0f;
+    float acc4 = 0.0f;
+    float acc5 = 0.0f;
+
+    int64_t bb = ((int64_t)kk * T + t) * D;
+
+    for (int d = lane; d < D; d += 32) {
+        float b = base[bb + d];
+
+        acc0 += b * mixT[0 * D + d];
+        acc1 += b * mixT[1 * D + d];
+        acc2 += b * mixT[2 * D + d];
+        acc3 += b * mixT[3 * D + d];
+        acc4 += b * mixT[4 * D + d];
+        acc5 += b * mixT[5 * D + d];
+    }
+
+    acc0 = warp_sum_float(acc0);
+    acc1 = warp_sum_float(acc1);
+    acc2 = warp_sum_float(acc2);
+    acc3 = warp_sum_float(acc3);
+    acc4 = warp_sum_float(acc4);
+    acc5 = warp_sum_float(acc5);
+
+    if (lane == 0) {
+        int64_t ob = (int64_t)t * 18;
+        gk[ob + 0 * 3 + kk] = acc0;
+        gk[ob + 1 * 3 + kk] = acc1;
+        gk[ob + 2 * 3 + kk] = acc2;
+        gk[ob + 3 * 3 + kk] = acc3;
+        gk[ob + 4 * 3 + kk] = acc4;
+        gk[ob + 5 * 3 + kk] = acc5;
+    }
+}
+
+template <int T_TILE, int N_TILE>
+__global__ void base_n16k3_grad_kernel_warp_kernel(
+    const float* __restrict__ base,
+    const float* __restrict__ mixT,
+    float* __restrict__ gk,
+    int D,
+    int T
+) {
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int t = blockIdx.x * T_TILE + warp;
+    int kk = blockIdx.y;
+    int ntile = blockIdx.z;
+    int nbase = ntile * N_TILE;
+
+    if (warp >= T_TILE || t >= T) return;
+
+    float acc[N_TILE];
+
+#pragma unroll
+    for (int i = 0; i < N_TILE; ++i) acc[i] = 0.0f;
+
+    int64_t bb = ((int64_t)kk * T + t) * D;
+
+    for (int d = lane; d < D; d += 32) {
+        float b = base[bb + d];
+
+#pragma unroll
+        for (int i = 0; i < N_TILE; ++i) {
+            int n = nbase + i;
+            if (n < 16) acc[i] += b * mixT[n * D + d];
+        }
+    }
+
+#pragma unroll
+    for (int i = 0; i < N_TILE; ++i) {
+        acc[i] = warp_sum_float(acc[i]);
+    }
+
+    if (lane == 0) {
+        int64_t ob = (int64_t)t * 48;
+
+#pragma unroll
+        for (int i = 0; i < N_TILE; ++i) {
+            int n = nbase + i;
+            if (n < 16) gk[ob + n * 3 + kk] = acc[i];
+        }
+    }
+}
+
+// ======================================================================================
+// Base-coalesced grad_mix N6/N16
+// ======================================================================================
+
+template <int TILE_T>
+__global__ void base_n6k3_grad_mix_partial_kernel(
+    const float* __restrict__ base,
+    const void* __restrict__ kc_void,
+    float* __restrict__ partial,
+    int T,
+    int dtype_tag
+) {
+    int d = blockIdx.x;
+    int tile = blockIdx.y;
+    int tid = threadIdx.x;
+
+    int start = tile * TILE_T;
+    int end = start + TILE_T;
+    if (end > T) end = T;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    float acc2 = 0.0f;
+    float acc3 = 0.0f;
+    float acc4 = 0.0f;
+    float acc5 = 0.0f;
+
+    for (int t = start + tid; t < end; t += blockDim.x) {
+#pragma unroll
+        for (int kk = 0; kk < 3; ++kk) {
+            float b = base[((int64_t)kk * T + t) * 256 + d];
+            int64_t kb = (int64_t)t * 18 + kk;
+
+            if (dtype_tag == 0) {
+                const float* kc = reinterpret_cast<const float*>(kc_void);
+                acc0 += b * kc[kb + 0 * 3];
+                acc1 += b * kc[kb + 1 * 3];
+                acc2 += b * kc[kb + 2 * 3];
+                acc3 += b * kc[kb + 3 * 3];
+                acc4 += b * kc[kb + 4 * 3];
+                acc5 += b * kc[kb + 5 * 3];
+            } else if (dtype_tag == 1) {
+                const c10::Half* kc = reinterpret_cast<const c10::Half*>(kc_void);
+                acc0 += b * to_float_dev(kc[kb + 0 * 3]);
+                acc1 += b * to_float_dev(kc[kb + 1 * 3]);
+                acc2 += b * to_float_dev(kc[kb + 2 * 3]);
+                acc3 += b * to_float_dev(kc[kb + 3 * 3]);
+                acc4 += b * to_float_dev(kc[kb + 4 * 3]);
+                acc5 += b * to_float_dev(kc[kb + 5 * 3]);
+            } else {
+                const c10::BFloat16* kc = reinterpret_cast<const c10::BFloat16*>(kc_void);
+                acc0 += b * to_float_dev(kc[kb + 0 * 3]);
+                acc1 += b * to_float_dev(kc[kb + 1 * 3]);
+                acc2 += b * to_float_dev(kc[kb + 2 * 3]);
+                acc3 += b * to_float_dev(kc[kb + 3 * 3]);
+                acc4 += b * to_float_dev(kc[kb + 4 * 3]);
+                acc5 += b * to_float_dev(kc[kb + 5 * 3]);
+            }
+        }
+    }
+
+    int lane = tid & 31;
+    int warp = tid >> 5;
+
+    acc0 = warp_sum_float(acc0);
+    acc1 = warp_sum_float(acc1);
+    acc2 = warp_sum_float(acc2);
+    acc3 = warp_sum_float(acc3);
+    acc4 = warp_sum_float(acc4);
+    acc5 = warp_sum_float(acc5);
+
+    __shared__ float sh[8 * 6];
+
+    if (lane == 0) {
+        sh[warp * 6 + 0] = acc0;
+        sh[warp * 6 + 1] = acc1;
+        sh[warp * 6 + 2] = acc2;
+        sh[warp * 6 + 3] = acc3;
+        sh[warp * 6 + 4] = acc4;
+        sh[warp * 6 + 5] = acc5;
+    }
+
+    __syncthreads();
+
+    if (warp == 0) {
+        float v0 = lane < 8 ? sh[lane * 6 + 0] : 0.0f;
+        float v1 = lane < 8 ? sh[lane * 6 + 1] : 0.0f;
+        float v2 = lane < 8 ? sh[lane * 6 + 2] : 0.0f;
+        float v3 = lane < 8 ? sh[lane * 6 + 3] : 0.0f;
+        float v4 = lane < 8 ? sh[lane * 6 + 4] : 0.0f;
+        float v5 = lane < 8 ? sh[lane * 6 + 5] : 0.0f;
+
+        v0 = warp_sum_float(v0);
+        v1 = warp_sum_float(v1);
+        v2 = warp_sum_float(v2);
+        v3 = warp_sum_float(v3);
+        v4 = warp_sum_float(v4);
+        v5 = warp_sum_float(v5);
+
+        if (lane == 0) {
+            int64_t ob = ((int64_t)tile * 256 + d) * 6;
+            partial[ob + 0] = v0;
+            partial[ob + 1] = v1;
+            partial[ob + 2] = v2;
+            partial[ob + 3] = v3;
+            partial[ob + 4] = v4;
+            partial[ob + 5] = v5;
+        }
+    }
+}
+
+template <int TILE_T, int N_TILE>
+__global__ void base_n16k3_grad_mix_partial_kernel(
+    const float* __restrict__ base,
+    const void* __restrict__ kc_void,
+    float* __restrict__ partial,
+    int T,
+    int dtype_tag
+) {
+    int d = blockIdx.x;
+    int ntile = blockIdx.y;
+    int tile = blockIdx.z;
+    int tid = threadIdx.x;
+    int nbase = ntile * N_TILE;
+
+    int start = tile * TILE_T;
+    int end = start + TILE_T;
+    if (end > T) end = T;
+
+    float acc[N_TILE];
+
+#pragma unroll
+    for (int i = 0; i < N_TILE; ++i) acc[i] = 0.0f;
+
+    for (int t = start + tid; t < end; t += blockDim.x) {
+#pragma unroll
+        for (int kk = 0; kk < 3; ++kk) {
+            float b = base[((int64_t)kk * T + t) * 256 + d];
+            int64_t kb = (int64_t)t * 48 + kk;
+
+#pragma unroll
+            for (int i = 0; i < N_TILE; ++i) {
+                int n = nbase + i;
+                if (n < 16) {
+                    if (dtype_tag == 0) {
+                        const float* kc = reinterpret_cast<const float*>(kc_void);
+                        acc[i] += b * kc[kb + n * 3];
+                    } else if (dtype_tag == 1) {
+                        const c10::Half* kc = reinterpret_cast<const c10::Half*>(kc_void);
+                        acc[i] += b * to_float_dev(kc[kb + n * 3]);
+                    } else {
+                        const c10::BFloat16* kc = reinterpret_cast<const c10::BFloat16*>(kc_void);
+                        acc[i] += b * to_float_dev(kc[kb + n * 3]);
+                    }
+                }
+            }
+        }
+    }
+
+    int lane = tid & 31;
+    int warp = tid >> 5;
+
+#pragma unroll
+    for (int i = 0; i < N_TILE; ++i) {
+        acc[i] = warp_sum_float(acc[i]);
+    }
+
+    __shared__ float sh[8 * N_TILE];
+
+    if (lane == 0) {
+#pragma unroll
+        for (int i = 0; i < N_TILE; ++i) {
+            sh[warp * N_TILE + i] = acc[i];
+        }
+    }
+
+    __syncthreads();
+
+    if (warp == 0) {
+        float v[N_TILE];
+
+#pragma unroll
+        for (int i = 0; i < N_TILE; ++i) {
+            v[i] = lane < 8 ? sh[lane * N_TILE + i] : 0.0f;
+            v[i] = warp_sum_float(v[i]);
+        }
+
+        if (lane == 0) {
+            int64_t ob = (((int64_t)tile * 256 + d) * 16 + nbase);
+
+#pragma unroll
+            for (int i = 0; i < N_TILE; ++i) {
+                int n = nbase + i;
+                if (n < 16) partial[ob + i] = v[i];
+            }
+        }
+    }
+}
+
+template <int N>
+__global__ void grad_mix_finalize_n_all_kernel(
+    const float* __restrict__ partial,
+    float* __restrict__ gm,
+    int tiles
+) {
+    int d = blockIdx.x;
+    int n = blockIdx.y;
+    int tid = threadIdx.x;
+
+    float acc = 0.0f;
+
+    for (int tile = tid; tile < tiles; tile += blockDim.x) {
+        acc += partial[((int64_t)tile * 256 + d) * N + n];
+    }
+
+    acc = warp_sum_float(acc);
+
+    __shared__ float sh[8];
+
+    int lane = tid & 31;
+    int warp = tid >> 5;
+
+    if (lane == 0) sh[warp] = acc;
+    __syncthreads();
+
+    if (warp == 0) {
+        float v = lane < 8 ? sh[lane] : 0.0f;
+        v = warp_sum_float(v);
+        if (lane == 0) gm[d * N + n] = v;
+    }
+}
+
+// ======================================================================================
+// N16 grad_h
 // ======================================================================================
 
 template <typename scalar_t>
@@ -920,217 +1392,8 @@ __global__ void mid_n16k3_grad_h_kernel(
     gh[(int64_t)d * L + s] = acc;
 }
 
-template <typename scalar_t, int T_TILE>
-__global__ void mid_n16k3_grad_kernel_warp_kernel(
-    const scalar_t* __restrict__ go,
-    const scalar_t* __restrict__ h,
-    const scalar_t* __restrict__ mix,
-    float* __restrict__ gk,
-    int L,
-    int T,
-    int off
-) {
-    int lane = threadIdx.x & 31;
-    int warp = threadIdx.x >> 5;
-    int t = blockIdx.x * T_TILE + warp;
-    int kk = blockIdx.y;
-
-    if (warp >= T_TILE || t >= T) return;
-
-    int s = off + t - kk;
-
-    float acc[16];
-
-#pragma unroll
-    for (int i = 0; i < 16; ++i) {
-        acc[i] = 0.0f;
-    }
-
-    if (s >= 0 && s < L) {
-        for (int d = lane; d < 256; d += 32) {
-            float base =
-                to_float_dev(go[(int64_t)d * T + t]) *
-                to_float_dev(h[(int64_t)d * L + s]);
-
-            int mb = d * 16;
-
-#pragma unroll
-            for (int n = 0; n < 16; ++n) {
-                acc[n] += base * to_float_dev(mix[mb + n]);
-            }
-        }
-    }
-
-#pragma unroll
-    for (int n = 0; n < 16; ++n) {
-        acc[n] = warp_sum_float(acc[n]);
-    }
-
-    if (lane == 0) {
-        int64_t base = (int64_t)t * 48;
-
-#pragma unroll
-        for (int n = 0; n < 16; ++n) {
-            gk[base + n * 3 + kk] = acc[n];
-        }
-    }
-}
-
-template <typename scalar_t, int TILE_T>
-__global__ void mid_n16k3_grad_mix_partial_alln_kernel(
-    const scalar_t* __restrict__ go,
-    const scalar_t* __restrict__ h,
-    const scalar_t* __restrict__ kc,
-    float* __restrict__ partial,
-    int L,
-    int T,
-    int off,
-    int tiles
-) {
-    int d = blockIdx.x;
-    int tile = blockIdx.y;
-    int tid = threadIdx.x;
-
-    int start = tile * TILE_T;
-    int end = start + TILE_T;
-    if (end > T) end = T;
-
-    float acc[16];
-
-#pragma unroll
-    for (int n = 0; n < 16; ++n) {
-        acc[n] = 0.0f;
-    }
-
-    for (int t = start + tid; t < end; t += blockDim.x) {
-        float g = to_float_dev(go[(int64_t)d * T + t]);
-
-#pragma unroll
-        for (int kk = 0; kk < 3; ++kk) {
-            int s = off + t - kk;
-
-            if (s >= 0 && s < L) {
-                float base = g * to_float_dev(h[(int64_t)d * L + s]);
-                int64_t kb = (int64_t)t * 48 + kk;
-
-#pragma unroll
-                for (int n = 0; n < 16; ++n) {
-                    acc[n] += base * to_float_dev(kc[kb + n * 3]);
-                }
-            }
-        }
-    }
-
-    int lane = tid & 31;
-    int warp = tid >> 5;
-
-#pragma unroll
-    for (int n = 0; n < 16; ++n) {
-        acc[n] = warp_sum_float(acc[n]);
-    }
-
-    __shared__ float sh[8 * 16];
-
-    if (lane == 0) {
-#pragma unroll
-        for (int n = 0; n < 16; ++n) {
-            sh[warp * 16 + n] = acc[n];
-        }
-    }
-
-    __syncthreads();
-
-    if (warp == 0) {
-        float v[16];
-
-#pragma unroll
-        for (int n = 0; n < 16; ++n) {
-            v[n] = lane < 8 ? sh[lane * 16 + n] : 0.0f;
-        }
-
-#pragma unroll
-        for (int n = 0; n < 16; ++n) {
-            v[n] = warp_sum_float(v[n]);
-        }
-
-        if (lane == 0) {
-            int64_t ob = ((int64_t)tile * 256 + d) * 16;
-
-#pragma unroll
-            for (int n = 0; n < 16; ++n) {
-                partial[ob + n] = v[n];
-            }
-        }
-    }
-}
-
-__global__ void mid_n16k3_grad_mix_finalize_alln_kernel(
-    const float* __restrict__ partial,
-    float* __restrict__ gm,
-    int tiles
-) {
-    int d = blockIdx.x;
-    int tid = threadIdx.x;
-
-    float acc[16];
-
-#pragma unroll
-    for (int n = 0; n < 16; ++n) {
-        acc[n] = 0.0f;
-    }
-
-    for (int tile = tid; tile < tiles; tile += blockDim.x) {
-        int64_t ib = ((int64_t)tile * 256 + d) * 16;
-
-#pragma unroll
-        for (int n = 0; n < 16; ++n) {
-            acc[n] += partial[ib + n];
-        }
-    }
-
-    int lane = tid & 31;
-    int warp = tid >> 5;
-
-#pragma unroll
-    for (int n = 0; n < 16; ++n) {
-        acc[n] = warp_sum_float(acc[n]);
-    }
-
-    __shared__ float sh[8 * 16];
-
-    if (lane == 0) {
-#pragma unroll
-        for (int n = 0; n < 16; ++n) {
-            sh[warp * 16 + n] = acc[n];
-        }
-    }
-
-    __syncthreads();
-
-    if (warp == 0) {
-        float v[16];
-
-#pragma unroll
-        for (int n = 0; n < 16; ++n) {
-            v[n] = lane < 8 ? sh[lane * 16 + n] : 0.0f;
-        }
-
-#pragma unroll
-        for (int n = 0; n < 16; ++n) {
-            v[n] = warp_sum_float(v[n]);
-        }
-
-        if (lane == 0) {
-#pragma unroll
-            for (int n = 0; n < 16; ++n) {
-                gm[d * 16 + n] = v[n];
-            }
-        }
-    }
-}
-
 // ======================================================================================
-// Small and mid wrappers
+// Small wrappers
 // ======================================================================================
 
 template <typename scalar_t>
@@ -1141,6 +1404,8 @@ static std::vector<torch::Tensor> backward_small_n6k3_typed(
     torch::Tensor mix,
     int64_t off
 ) {
+    FDC_DEBUG_PATH("FDC path: backward_small_n6k3");
+
     int L = h.size(2);
     int T = kc.size(1);
 
@@ -1248,6 +1513,26 @@ static std::vector<torch::Tensor> backward_small_n6k3_typed(
     }
 }
 
+static std::vector<torch::Tensor> backward_small_n6k3(
+    torch::Tensor go,
+    torch::Tensor h,
+    torch::Tensor kc,
+    torch::Tensor mix,
+    int64_t off
+) {
+    if (h.scalar_type() == at::ScalarType::Float) {
+        return backward_small_n6k3_typed<float>(go, h, kc, mix, off);
+    }
+    if (h.scalar_type() == at::ScalarType::Half) {
+        return backward_small_n6k3_typed<c10::Half>(go, h, kc, mix, off);
+    }
+    return backward_small_n6k3_typed<c10::BFloat16>(go, h, kc, mix, off);
+}
+
+// ======================================================================================
+// Mid N6 warp wrapper
+// ======================================================================================
+
 template <typename scalar_t>
 static std::vector<torch::Tensor> backward_mid_n6k3_warp_typed(
     torch::Tensor go,
@@ -1257,6 +1542,8 @@ static std::vector<torch::Tensor> backward_mid_n6k3_warp_typed(
     int64_t off,
     bool full4096_offset0
 ) {
+    FDC_DEBUG_PATH("FDC path: backward_mid_n6k3_warp");
+
     int L = h.size(2);
     int T = kc.size(1);
 
@@ -1266,7 +1553,7 @@ static std::vector<torch::Tensor> backward_mid_n6k3_warp_typed(
     auto gmf = torch::empty(mix.sizes(), fopts);
 
     constexpr int T_TILE = 8;
-    constexpr int MIX_TILE_T = 1024;
+    constexpr int MIX_TILE_T = 2048;
 
     int tiles = (T + MIX_TILE_T - 1) / MIX_TILE_T;
     auto partial = torch::empty({tiles, 256, 6}, fopts);
@@ -1303,7 +1590,6 @@ static std::vector<torch::Tensor> backward_mid_n6k3_warp_typed(
     }
 
     dim3 gkg((T + T_TILE - 1) / T_TILE, 3, 1);
-
     mid_n6k3_grad_kernel_warp_kernel<scalar_t, T_TILE><<<
         gkg,
         256,
@@ -1321,7 +1607,6 @@ static std::vector<torch::Tensor> backward_mid_n6k3_warp_typed(
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
     dim3 pg(256, tiles, 1);
-
     mid_n6k3_grad_mix_partial_alln_kernel<scalar_t, MIX_TILE_T><<<
         pg,
         256,
@@ -1398,14 +1683,59 @@ static std::vector<torch::Tensor> backward_mid_n6k3_warp_typed(
     }
 }
 
-template <typename scalar_t>
-static std::vector<torch::Tensor> backward_mid_n16k3_warp_typed(
+static std::vector<torch::Tensor> backward_mid_n6k3_warp(
     torch::Tensor go,
     torch::Tensor h,
     torch::Tensor kc,
     torch::Tensor mix,
-    int64_t off
+    int64_t off,
+    bool full4096_offset0
 ) {
+    if (h.scalar_type() == at::ScalarType::Float) {
+        return backward_mid_n6k3_warp_typed<float>(
+            go,
+            h,
+            kc,
+            mix,
+            off,
+            full4096_offset0
+        );
+    }
+    if (h.scalar_type() == at::ScalarType::Half) {
+        return backward_mid_n6k3_warp_typed<c10::Half>(
+            go,
+            h,
+            kc,
+            mix,
+            off,
+            full4096_offset0
+        );
+    }
+    return backward_mid_n6k3_warp_typed<c10::BFloat16>(
+        go,
+        h,
+        kc,
+        mix,
+        off,
+        full4096_offset0
+    );
+}
+
+// ======================================================================================
+// Base coalesced wrappers
+// ======================================================================================
+
+template <typename scalar_t>
+static std::vector<torch::Tensor> backward_base_n6k3_typed(
+    torch::Tensor go,
+    torch::Tensor h,
+    torch::Tensor kc,
+    torch::Tensor mix,
+    int64_t off,
+    bool full4096_offset0
+) {
+    FDC_DEBUG_PATH("FDC path: backward_base_n6k3");
+
     int L = h.size(2);
     int T = kc.size(1);
 
@@ -1413,68 +1743,113 @@ static std::vector<torch::Tensor> backward_mid_n16k3_warp_typed(
     auto ghf = torch::empty(h.sizes(), fopts);
     auto gkf = torch::empty(kc.sizes(), fopts);
     auto gmf = torch::empty(mix.sizes(), fopts);
+    auto base = torch::empty({3, T, 256}, fopts);
+    auto mixT = torch::empty({6, 256}, fopts);
 
     constexpr int T_TILE = 8;
     constexpr int MIX_TILE_T = 1024;
 
     int tiles = (T + MIX_TILE_T - 1) / MIX_TILE_T;
-    auto partial = torch::empty({tiles, 256, 16}, fopts);
+    auto partial = torch::empty({tiles, 256, 6}, fopts);
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    int threads = 256;
 
-    dim3 bh(16, 16);
-    dim3 gh((L + 15) / 16, 16, 1);
-
-    mid_n16k3_grad_h_kernel<scalar_t><<<gh, bh, 0, stream>>>(
-        go.data_ptr<scalar_t>(),
-        kc.data_ptr<scalar_t>(),
+    make_mix_transpose_float_kernel<scalar_t><<<
+        (256 * 6 + threads - 1) / threads,
+        threads,
+        0,
+        stream
+    >>>(
         mix.data_ptr<scalar_t>(),
-        ghf.data_ptr<float>(),
+        mixT.data_ptr<float>(),
+        256,
+        6
+    );
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    make_base_ktd_float_kernel<scalar_t><<<
+        ((int64_t)3 * T * 256 + threads - 1) / threads,
+        threads,
+        0,
+        stream
+    >>>(
+        go.data_ptr<scalar_t>(),
+        h.data_ptr<scalar_t>(),
+        base.data_ptr<float>(),
+        256,
         L,
         T,
+        3,
         (int)off
     );
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
-    dim3 gkg((T + T_TILE - 1) / T_TILE, 3, 1);
+    if (full4096_offset0) {
+        full4096_n6k3_grad_h_kernel<scalar_t><<<
+            (256 * 4096 + 255) / 256,
+            256,
+            0,
+            stream
+        >>>(
+            go.data_ptr<scalar_t>(),
+            kc.data_ptr<scalar_t>(),
+            mix.data_ptr<scalar_t>(),
+            ghf.data_ptr<float>()
+        );
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    } else {
+        dim3 bh(16, 16);
+        dim3 gh((L + 15) / 16, 16, 1);
+        small_n6k3_grad_h_kernel<scalar_t><<<gh, bh, 0, stream>>>(
+            go.data_ptr<scalar_t>(),
+            kc.data_ptr<scalar_t>(),
+            mix.data_ptr<scalar_t>(),
+            ghf.data_ptr<float>(),
+            L,
+            T,
+            (int)off
+        );
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
 
-    mid_n16k3_grad_kernel_warp_kernel<scalar_t, T_TILE><<<
+    dim3 gkg((T + T_TILE - 1) / T_TILE, 3, 1);
+    base_n6k3_grad_kernel_warp_kernel<T_TILE><<<
         gkg,
         256,
         0,
         stream
     >>>(
-        go.data_ptr<scalar_t>(),
-        h.data_ptr<scalar_t>(),
-        mix.data_ptr<scalar_t>(),
+        base.data_ptr<float>(),
+        mixT.data_ptr<float>(),
         gkf.data_ptr<float>(),
-        L,
-        T,
-        (int)off
+        256,
+        T
     );
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
-    dim3 pg(256, tiles, 1);
+    int dtype_tag = 0;
+    if (h.scalar_type() == at::ScalarType::Half) dtype_tag = 1;
+    if (h.scalar_type() == at::ScalarType::BFloat16) dtype_tag = 2;
 
-    mid_n16k3_grad_mix_partial_alln_kernel<scalar_t, MIX_TILE_T><<<
+    dim3 pg(256, tiles, 1);
+    base_n6k3_grad_mix_partial_kernel<MIX_TILE_T><<<
         pg,
         256,
         0,
         stream
     >>>(
-        go.data_ptr<scalar_t>(),
-        h.data_ptr<scalar_t>(),
-        kc.data_ptr<scalar_t>(),
+        base.data_ptr<float>(),
+        static_cast<const void*>(kc.data_ptr<scalar_t>()),
         partial.data_ptr<float>(),
-        L,
         T,
-        (int)off,
-        tiles
+        dtype_tag
     );
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
-    mid_n16k3_grad_mix_finalize_alln_kernel<<<
-        256,
+    dim3 fg(256, 6, 1);
+    grad_mix_finalize_n_all_kernel<6><<<
+        fg,
         256,
         0,
         stream
@@ -1491,8 +1866,6 @@ static std::vector<torch::Tensor> backward_mid_n16k3_warp_typed(
         auto gh = torch::empty_like(h);
         auto gk = torch::empty_like(kc);
         auto gm = torch::empty_like(mix);
-
-        int threads = 256;
 
         cast_float_to_scalar_kernel<scalar_t><<<
             (gh.numel() + threads - 1) / threads,
@@ -1532,25 +1905,172 @@ static std::vector<torch::Tensor> backward_mid_n16k3_warp_typed(
     }
 }
 
-static std::vector<torch::Tensor> backward_small_n6k3(
+template <typename scalar_t>
+static std::vector<torch::Tensor> backward_base_n16k3_typed(
     torch::Tensor go,
     torch::Tensor h,
     torch::Tensor kc,
     torch::Tensor mix,
     int64_t off
 ) {
-    if (h.scalar_type() == at::ScalarType::Float) {
-        return backward_small_n6k3_typed<float>(go, h, kc, mix, off);
-    }
+    FDC_DEBUG_PATH("FDC path: backward_base_n16k3");
 
-    if (h.scalar_type() == at::ScalarType::Half) {
-        return backward_small_n6k3_typed<c10::Half>(go, h, kc, mix, off);
-    }
+    int L = h.size(2);
+    int T = kc.size(1);
 
-    return backward_small_n6k3_typed<c10::BFloat16>(go, h, kc, mix, off);
+    auto fopts = h.options().dtype(torch::kFloat32);
+    auto ghf = torch::empty(h.sizes(), fopts);
+    auto gkf = torch::empty(kc.sizes(), fopts);
+    auto gmf = torch::empty(mix.sizes(), fopts);
+    auto base = torch::empty({3, T, 256}, fopts);
+    auto mixT = torch::empty({16, 256}, fopts);
+
+    constexpr int T_TILE = 8;
+    constexpr int N_TILE = 4;
+    constexpr int MIX_TILE_T = 1024;
+
+    int tiles = (T + MIX_TILE_T - 1) / MIX_TILE_T;
+    auto partial = torch::empty({tiles, 256, 16}, fopts);
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    int threads = 256;
+
+    make_mix_transpose_float_kernel<scalar_t><<<
+        (256 * 16 + threads - 1) / threads,
+        threads,
+        0,
+        stream
+    >>>(
+        mix.data_ptr<scalar_t>(),
+        mixT.data_ptr<float>(),
+        256,
+        16
+    );
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    make_base_ktd_float_kernel<scalar_t><<<
+        ((int64_t)3 * T * 256 + threads - 1) / threads,
+        threads,
+        0,
+        stream
+    >>>(
+        go.data_ptr<scalar_t>(),
+        h.data_ptr<scalar_t>(),
+        base.data_ptr<float>(),
+        256,
+        L,
+        T,
+        3,
+        (int)off
+    );
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    dim3 bh(16, 16);
+    dim3 gh((L + 15) / 16, 16, 1);
+    mid_n16k3_grad_h_kernel<scalar_t><<<gh, bh, 0, stream>>>(
+        go.data_ptr<scalar_t>(),
+        kc.data_ptr<scalar_t>(),
+        mix.data_ptr<scalar_t>(),
+        ghf.data_ptr<float>(),
+        L,
+        T,
+        (int)off
+    );
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    dim3 gkg((T + T_TILE - 1) / T_TILE, 3, 4);
+    base_n16k3_grad_kernel_warp_kernel<T_TILE, N_TILE><<<
+        gkg,
+        256,
+        0,
+        stream
+    >>>(
+        base.data_ptr<float>(),
+        mixT.data_ptr<float>(),
+        gkf.data_ptr<float>(),
+        256,
+        T
+    );
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    int dtype_tag = 0;
+    if (h.scalar_type() == at::ScalarType::Half) dtype_tag = 1;
+    if (h.scalar_type() == at::ScalarType::BFloat16) dtype_tag = 2;
+
+    dim3 pg(256, 4, tiles);
+    base_n16k3_grad_mix_partial_kernel<MIX_TILE_T, N_TILE><<<
+        pg,
+        256,
+        0,
+        stream
+    >>>(
+        base.data_ptr<float>(),
+        static_cast<const void*>(kc.data_ptr<scalar_t>()),
+        partial.data_ptr<float>(),
+        T,
+        dtype_tag
+    );
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    dim3 fg(256, 16, 1);
+    grad_mix_finalize_n_all_kernel<16><<<
+        fg,
+        256,
+        0,
+        stream
+    >>>(
+        partial.data_ptr<float>(),
+        gmf.data_ptr<float>(),
+        tiles
+    );
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    if constexpr (std::is_same<scalar_t, float>::value) {
+        return {ghf, gkf, gmf};
+    } else {
+        auto gh = torch::empty_like(h);
+        auto gk = torch::empty_like(kc);
+        auto gm = torch::empty_like(mix);
+
+        cast_float_to_scalar_kernel<scalar_t><<<
+            (gh.numel() + threads - 1) / threads,
+            threads,
+            0,
+            stream
+        >>>(
+            ghf.data_ptr<float>(),
+            gh.data_ptr<scalar_t>(),
+            gh.numel()
+        );
+
+        cast_float_to_scalar_kernel<scalar_t><<<
+            (gk.numel() + threads - 1) / threads,
+            threads,
+            0,
+            stream
+        >>>(
+            gkf.data_ptr<float>(),
+            gk.data_ptr<scalar_t>(),
+            gk.numel()
+        );
+
+        cast_float_to_scalar_kernel<scalar_t><<<
+            (gm.numel() + threads - 1) / threads,
+            threads,
+            0,
+            stream
+        >>>(
+            gmf.data_ptr<float>(),
+            gm.data_ptr<scalar_t>(),
+            gm.numel()
+        );
+
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        return {gh, gk, gm};
+    }
 }
 
-static std::vector<torch::Tensor> backward_mid_n6k3_warp(
+static std::vector<torch::Tensor> backward_base_n6k3(
     torch::Tensor go,
     torch::Tensor h,
     torch::Tensor kc,
@@ -1559,38 +2079,15 @@ static std::vector<torch::Tensor> backward_mid_n6k3_warp(
     bool full4096_offset0
 ) {
     if (h.scalar_type() == at::ScalarType::Float) {
-        return backward_mid_n6k3_warp_typed<float>(
-            go,
-            h,
-            kc,
-            mix,
-            off,
-            full4096_offset0
-        );
+        return backward_base_n6k3_typed<float>(go, h, kc, mix, off, full4096_offset0);
     }
-
     if (h.scalar_type() == at::ScalarType::Half) {
-        return backward_mid_n6k3_warp_typed<c10::Half>(
-            go,
-            h,
-            kc,
-            mix,
-            off,
-            full4096_offset0
-        );
+        return backward_base_n6k3_typed<c10::Half>(go, h, kc, mix, off, full4096_offset0);
     }
-
-    return backward_mid_n6k3_warp_typed<c10::BFloat16>(
-        go,
-        h,
-        kc,
-        mix,
-        off,
-        full4096_offset0
-    );
+    return backward_base_n6k3_typed<c10::BFloat16>(go, h, kc, mix, off, full4096_offset0);
 }
 
-static std::vector<torch::Tensor> backward_mid_n16k3_warp(
+static std::vector<torch::Tensor> backward_base_n16k3(
     torch::Tensor go,
     torch::Tensor h,
     torch::Tensor kc,
@@ -1598,32 +2095,12 @@ static std::vector<torch::Tensor> backward_mid_n16k3_warp(
     int64_t off
 ) {
     if (h.scalar_type() == at::ScalarType::Float) {
-        return backward_mid_n16k3_warp_typed<float>(
-            go,
-            h,
-            kc,
-            mix,
-            off
-        );
+        return backward_base_n16k3_typed<float>(go, h, kc, mix, off);
     }
-
     if (h.scalar_type() == at::ScalarType::Half) {
-        return backward_mid_n16k3_warp_typed<c10::Half>(
-            go,
-            h,
-            kc,
-            mix,
-            off
-        );
+        return backward_base_n16k3_typed<c10::Half>(go, h, kc, mix, off);
     }
-
-    return backward_mid_n16k3_warp_typed<c10::BFloat16>(
-        go,
-        h,
-        kc,
-        mix,
-        off
-    );
+    return backward_base_n16k3_typed<c10::BFloat16>(go, h, kc, mix, off);
 }
 
 // ======================================================================================
@@ -1638,6 +2115,8 @@ static std::vector<torch::Tensor> backward_large(
     int64_t off,
     int64_t dilation
 ) {
+    FDC_DEBUG_PATH("FDC path: backward_large");
+
     int B = h.size(0);
     int D = h.size(1);
     int L = h.size(2);
@@ -1987,7 +2466,7 @@ static std::vector<torch::Tensor> backward_large(
 }
 
 // ======================================================================================
-// fp16 GemmEx v2 restricted path
+// fp16 GemmEx v3
 // ======================================================================================
 
 template <typename scalar_t>
@@ -2058,7 +2537,7 @@ __global__ void make_mix_half_kernel(
     }
 }
 
-static std::vector<torch::Tensor> backward_fp16_gemmex_v2(
+static std::vector<torch::Tensor> backward_fp16_gemmex_v3(
     torch::Tensor go,
     torch::Tensor h,
     torch::Tensor kc,
@@ -2066,6 +2545,8 @@ static std::vector<torch::Tensor> backward_fp16_gemmex_v2(
     int64_t off,
     int64_t dilation
 ) {
+    FDC_DEBUG_PATH("FDC path: backward_fp16_gemmex_v3");
+
     int B = h.size(0);
     int D = h.size(1);
     int L = h.size(2);
@@ -2083,7 +2564,7 @@ static std::vector<torch::Tensor> backward_fp16_gemmex_v2(
     auto mixh = torch::empty({D, N}, hopts);
     auto baseh = torch::empty({B, T, D}, hopts);
     auto kbtnh = torch::empty({B, T, N}, hopts);
-    auto gkbtnh = torch::empty({B, T, N}, hopts);
+    auto gkbtnf = torch::empty({B, T, N}, fopts);
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     cublasHandle_t handle = at::cuda::getCurrentCUDABlasHandle();
@@ -2091,17 +2572,6 @@ static std::vector<torch::Tensor> backward_fp16_gemmex_v2(
     check_cublas(
         cublasSetStream(handle, stream),
         "cublasSetStream failed"
-    );
-
-    cublasMath_t old_math;
-    check_cublas(
-        cublasGetMathMode(handle, &old_math),
-        "cublasGetMathMode failed"
-    );
-
-    check_cublas(
-        cublasSetMathMode(handle, CUBLAS_TENSOR_OP_MATH),
-        "cublasSetMathMode tensor op failed"
     );
 
     int threads = 256;
@@ -2191,24 +2661,24 @@ static std::vector<torch::Tensor> backward_fp16_gemmex_v2(
                 D,
                 (long long)T * D,
                 &beta0,
-                gkbtnh.data_ptr<c10::Half>(),
-                CUDA_R_16F,
+                gkbtnf.data_ptr<float>(),
+                CUDA_R_32F,
                 N,
                 (long long)T * N,
                 B,
                 CUBLAS_COMPUTE_32F,
                 CUBLAS_GEMM_DEFAULT_TENSOR_OP
             ),
-            "GemmEx grad_kernel half output failed"
+            "GemmEx v3 grad_kernel float output failed"
         );
 
-        copy_gk_half_kernel<<<
+        copy_gk_float_to_scalar_kernel<c10::Half><<<
             (B * T * N + threads - 1) / threads,
             threads,
             0,
             stream
         >>>(
-            gkbtnh.data_ptr<c10::Half>(),
+            gkbtnf.data_ptr<float>(),
             gk.data_ptr<c10::Half>(),
             B,
             T,
@@ -2244,14 +2714,9 @@ static std::vector<torch::Tensor> backward_fp16_gemmex_v2(
                 CUBLAS_COMPUTE_32F,
                 CUBLAS_GEMM_DEFAULT_TENSOR_OP
             ),
-            "GemmEx grad_mix float output failed"
+            "GemmEx v3 grad_mix float output failed"
         );
     }
-
-    check_cublas(
-        cublasSetMathMode(handle, old_math),
-        "cublasSetMathMode restore failed"
-    );
 
     auto gh = torch::empty_like(h);
     auto gm = torch::empty_like(mix);
@@ -2330,14 +2795,8 @@ std::vector<torch::Tensor> fused_dynamic_conv_backward_chunk_cuda(
         T == 4096 &&
         (int)off == 0;
 
-    bool fp16_gemmex_v2_t8192 =
-        is_fp16 &&
-        shape_n6 &&
-        T == 8192 &&
-        sm >= 75;
-
-    if (fp16_gemmex_v2_t8192) {
-        return backward_fp16_gemmex_v2(
+    if (is_fp16 && shape_n6 && T == 8192 && sm >= 75) {
+        return backward_fp16_gemmex_v3(
             go,
             h,
             kc,
@@ -2347,18 +2806,28 @@ std::vector<torch::Tensor> fused_dynamic_conv_backward_chunk_cuda(
         );
     }
 
-    if (full4096_offset0_n6 && (is_fp16 || is_fp32)) {
-        return backward_mid_n6k3_warp(
+    if (shape_n16 && T == 8192) {
+        return backward_base_n16k3(
+            go,
+            h,
+            kc,
+            mix,
+            off
+        );
+    }
+
+    if (shape_n6 && is_fp32 && (T == 4096 || T == 8192)) {
+        return backward_base_n6k3(
             go,
             h,
             kc,
             mix,
             off,
-            true
+            full4096_offset0_n6
         );
     }
 
-    if (shape_n6 && T == 8192 && (is_fp32 || is_bf16)) {
+    if (shape_n6 && is_bf16 && T == 8192) {
         return backward_mid_n6k3_warp(
             go,
             h,
@@ -2369,13 +2838,14 @@ std::vector<torch::Tensor> fused_dynamic_conv_backward_chunk_cuda(
         );
     }
 
-    if (shape_n16 && T == 8192) {
-        return backward_mid_n16k3_warp(
+    if (full4096_offset0_n6 && is_fp16) {
+        return backward_mid_n6k3_warp(
             go,
             h,
             kc,
             mix,
-            off
+            off,
+            true
         );
     }
 
