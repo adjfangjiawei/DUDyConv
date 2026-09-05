@@ -22,16 +22,12 @@ enum class FDCForwardPlan : int {
     DirectGeneric2D = 0,
     DirectGenericSmallNPreload = 1,
     DirectN6K3D256 = 2,
-    DirectN16K3D256 = 3,
-    DirectN6K7D256 = 4,
     DirectN6K3D512 = 5,
     NewGemmNK3D256 = 6,
     N32K3D256 = 7,
     N16K3D256 = 8,
     N64K3D256 = 9,
-    N128K3D256 = 10,
-    N256K3D256 = 11,
-    N512K3D256 = 12
+    N128K3D256 = 10
 };
 
 static inline const char* fdc_forward_plan_name_impl(FDCForwardPlan p) {
@@ -44,12 +40,6 @@ static inline const char* fdc_forward_plan_name_impl(FDCForwardPlan p) {
 
         case FDCForwardPlan::DirectN6K3D256:
             return "forward_direct_n6k3_d256";
-
-        case FDCForwardPlan::DirectN16K3D256:
-            return "forward_direct_n16k3_d256";
-
-        case FDCForwardPlan::DirectN6K7D256:
-            return "forward_direct_n6k7_d256";
 
         case FDCForwardPlan::DirectN6K3D512:
             return "forward_direct_n6k3_d512";
@@ -68,12 +58,6 @@ static inline const char* fdc_forward_plan_name_impl(FDCForwardPlan p) {
 
         case FDCForwardPlan::N128K3D256:
             return "forward_n128_k3_d256";
-
-        case FDCForwardPlan::N256K3D256:
-            return "forward_n256_k3_d256";
-
-        case FDCForwardPlan::N512K3D256:
-            return "forward_n512_k3_d256";
 
         default:
             return "unknown";
@@ -249,9 +233,6 @@ struct FDCForwardShapeInfo {
     bool n32k3d256;
     bool n64k3d256;
     bool n128k3d256;
-    bool n256k3d256;
-    bool n512k3d256;
-    bool n6k7d256;
     bool n6k3d512;
     bool smalln_preload;
 };
@@ -322,31 +303,6 @@ static inline FDCForwardShapeInfo make_fdc_forward_shape_info(
         s.dil1 &&
         s.is_fp32 &&
         s.T >= 512;
-
-    s.n256k3d256 =
-        s.B == 1 &&
-        s.D == 256 &&
-        s.N == 256 &&
-        s.K == 3 &&
-        s.dil1 &&
-        s.is_fp32 &&
-        s.T >= 512;
-
-    s.n512k3d256 =
-        s.B == 1 &&
-        s.D == 256 &&
-        s.N == 512 &&
-        s.K == 3 &&
-        s.dil1 &&
-        s.is_fp32 &&
-        s.T >= 512;
-
-    s.n6k7d256 =
-        s.B == 1 &&
-        s.D == 256 &&
-        s.N == 6 &&
-        s.K == 7 &&
-        s.dil1;
 
     s.n6k3d512 =
         s.B == 1 &&
@@ -436,8 +392,8 @@ static inline bool fdc_forward_plan_available(
         case FDCForwardPlan::DirectN6K3D256:
             return s.n6k3d256;
 
-        case FDCForwardPlan::DirectN16K3D256:
-            return s.n16k3d256;
+        case FDCForwardPlan::DirectN6K3D512:
+            return s.n6k3d512;
 
         case FDCForwardPlan::N16K3D256:
             return fdc_forward_n16_k3_d256_available_cuda(
@@ -474,30 +430,6 @@ static inline bool fdc_forward_plan_available(
                 off,
                 dilation
             );
-
-        case FDCForwardPlan::N256K3D256:
-            return fdc_forward_n256_k3_d256_available_cuda(
-                h,
-                kc,
-                mix,
-                off,
-                dilation
-            );
-
-        case FDCForwardPlan::N512K3D256:
-            return fdc_forward_n512_k3_d256_available_cuda(
-                h,
-                kc,
-                mix,
-                off,
-                dilation
-            );
-
-        case FDCForwardPlan::DirectN6K7D256:
-            return s.n6k7d256;
-
-        case FDCForwardPlan::DirectN6K3D512:
-            return s.n6k3d512;
 
         case FDCForwardPlan::NewGemmNK3D256:
             return fdc_new_gemm_nk3_d256_available_cuda(
@@ -552,8 +484,8 @@ static torch::Tensor fdc_run_forward_plan(
                 off
             );
 
-        case FDCForwardPlan::DirectN16K3D256:
-            return fdc_forward_direct_n16k3_d256_cuda(
+        case FDCForwardPlan::DirectN6K3D512:
+            return fdc_forward_direct_n6k3_d512_cuda(
                 h,
                 kc,
                 mix,
@@ -586,38 +518,6 @@ static torch::Tensor fdc_run_forward_plan(
 
         case FDCForwardPlan::N128K3D256:
             return fdc_forward_n128_k3_d256_cuda(
-                h,
-                kc,
-                mix,
-                off
-            );
-
-        case FDCForwardPlan::N256K3D256:
-            return fdc_forward_n256_k3_d256_cuda(
-                h,
-                kc,
-                mix,
-                off
-            );
-
-        case FDCForwardPlan::N512K3D256:
-            return fdc_forward_n512_k3_d256_cuda(
-                h,
-                kc,
-                mix,
-                off
-            );
-
-        case FDCForwardPlan::DirectN6K7D256:
-            return fdc_forward_direct_n6k7_d256_cuda(
-                h,
-                kc,
-                mix,
-                off
-            );
-
-        case FDCForwardPlan::DirectN6K3D512:
-            return fdc_forward_direct_n6k3_d512_cuda(
                 h,
                 kc,
                 mix,
@@ -696,40 +596,22 @@ static FDCForwardPlan fdc_default_forward_plan(
         return FDCForwardPlan::N128K3D256;
     }
 
-    if (s.n256k3d256 && fdc_forward_n256_k3_d256_available_cuda(
-            h,
-            kc,
-            mix,
-            off,
-            dilation
-        )) {
-        return FDCForwardPlan::N256K3D256;
-    }
-
-    if (s.n512k3d256 && fdc_forward_n512_k3_d256_available_cuda(
-            h,
-            kc,
-            mix,
-            off,
-            dilation
-        )) {
-        return FDCForwardPlan::N512K3D256;
-    }
-
     if (s.n6k3d256) {
         return FDCForwardPlan::DirectN6K3D256;
     }
 
-    if (s.n16k3d256) {
-        return FDCForwardPlan::DirectN16K3D256;
-    }
-
-    if (s.n6k7d256) {
-        return FDCForwardPlan::DirectN6K7D256;
-    }
-
     if (s.n6k3d512) {
         return FDCForwardPlan::DirectN6K3D512;
+    }
+
+    if (fdc_new_gemm_nk3_d256_available_cuda(
+            h,
+            kc,
+            mix,
+            off,
+            dilation
+        )) {
+        return FDCForwardPlan::NewGemmNK3D256;
     }
 
     if (s.smalln_preload) {
@@ -757,12 +639,8 @@ static std::vector<FDCForwardPlan> fdc_all_candidate_forward_plans(
         FDCForwardPlan::N32K3D256,
         FDCForwardPlan::N64K3D256,
         FDCForwardPlan::N128K3D256,
-        FDCForwardPlan::N256K3D256,
-        FDCForwardPlan::N512K3D256,
 
         FDCForwardPlan::DirectN6K3D256,
-        FDCForwardPlan::DirectN16K3D256,
-        FDCForwardPlan::DirectN6K7D256,
         FDCForwardPlan::DirectN6K3D512,
         FDCForwardPlan::DirectGenericSmallNPreload,
         FDCForwardPlan::NewGemmNK3D256,

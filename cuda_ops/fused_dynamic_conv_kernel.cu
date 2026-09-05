@@ -19,66 +19,21 @@
 // ======================================================================================
 
 enum class FDCBackwardPlan : int {
-    SmallN6K3 = 0,
     MidN6K3Warp = 1,
-    BaseN6K3 = 2,
-    BaseN16K3 = 3,
     Large = 4,
-    FP16GemmExV3 = 5,
-    NewGemmNK3D256 = 6,
-    ManyNK3D256 = 7,
-
-    N16K3D256 = 8,
-    N32K3D256 = 9,
-    N64K3D256 = 10,
-    N128K3D256 = 11,
-    N256K3D256 = 12,
-    N512K3D256 = 13
+    ManyNK3D256 = 7
 };
 
 static inline const char* fdc_backward_plan_name_impl(FDCBackwardPlan p) {
     switch (p) {
-        case FDCBackwardPlan::SmallN6K3:
-            return "backward_small_n6k3";
-
         case FDCBackwardPlan::MidN6K3Warp:
             return "backward_mid_n6k3_warp";
-
-        case FDCBackwardPlan::BaseN6K3:
-            return "backward_base_n6k3";
-
-        case FDCBackwardPlan::BaseN16K3:
-            return "backward_base_n16k3";
 
         case FDCBackwardPlan::Large:
             return "backward_large";
 
-        case FDCBackwardPlan::FP16GemmExV3:
-            return "backward_fp16_gemmex_v3";
-
-        case FDCBackwardPlan::NewGemmNK3D256:
-            return "backward_new_gemm_nk3_d256";
-
         case FDCBackwardPlan::ManyNK3D256:
             return "backward_manyn_k3_d256";
-
-        case FDCBackwardPlan::N16K3D256:
-            return "backward_n16_k3_d256";
-
-        case FDCBackwardPlan::N32K3D256:
-            return "backward_n32_k3_d256";
-
-        case FDCBackwardPlan::N64K3D256:
-            return "backward_n64_k3_d256";
-
-        case FDCBackwardPlan::N128K3D256:
-            return "backward_n128_k3_d256";
-
-        case FDCBackwardPlan::N256K3D256:
-            return "backward_n256_k3_d256";
-
-        case FDCBackwardPlan::N512K3D256:
-            return "backward_n512_k3_d256";
 
         default:
             return "unknown";
@@ -245,7 +200,6 @@ struct FDCShapeInfo {
     bool base_d256_k3_dil1;
     bool shape_n6;
     bool shape_n6_d512;
-    bool shape_n16;
     bool shape_manyn_k3_d256;
     bool full4096_offset0_n6;
 };
@@ -287,10 +241,6 @@ static inline FDCShapeInfo make_fdc_shape_info(
         s.base_k3_dil1 &&
         s.D == 512 &&
         s.N == 6;
-
-    s.shape_n16 =
-        s.base_d256_k3_dil1 &&
-        s.N == 16;
 
     s.shape_manyn_k3_d256 =
         s.base_d256_k3_dil1 &&
@@ -396,17 +346,8 @@ static inline bool fdc_plan_available(
     );
 
     switch (plan) {
-        case FDCBackwardPlan::SmallN6K3:
-            return s.shape_n6;
-
         case FDCBackwardPlan::MidN6K3Warp:
             return s.shape_n6 || s.shape_n6_d512;
-
-        case FDCBackwardPlan::BaseN6K3:
-            return s.shape_n6;
-
-        case FDCBackwardPlan::BaseN16K3:
-            return s.shape_n16;
 
         case FDCBackwardPlan::ManyNK3D256:
             return s.shape_manyn_k3_d256 &&
@@ -415,81 +356,12 @@ static inline bool fdc_plan_available(
         case FDCBackwardPlan::Large:
             return s.is_fp32 || s.is_fp16 || s.is_bf16;
 
-        case FDCBackwardPlan::FP16GemmExV3:
-            return s.is_fp16 && s.shape_n6 && s.sm >= 75;
-
-        case FDCBackwardPlan::NewGemmNK3D256:
-            return fdc_new_gemm_nk3_d256_available_cuda(
-                h,
-                kc,
-                mix,
-                off,
-                dilation
-            );
-
-        case FDCBackwardPlan::N16K3D256:
-            return fdc_backward_n16_k3_d256_available_cuda(
-                go,
-                h,
-                kc,
-                mix,
-                off,
-                dilation
-            );
-
-        case FDCBackwardPlan::N32K3D256:
-            return fdc_backward_n32_k3_d256_available_cuda(
-                go,
-                h,
-                kc,
-                mix,
-                off,
-                dilation
-            );
-
-        case FDCBackwardPlan::N64K3D256:
-            return fdc_backward_n64_k3_d256_available_cuda(
-                go,
-                h,
-                kc,
-                mix,
-                off,
-                dilation
-            );
-
-        case FDCBackwardPlan::N128K3D256:
-            return fdc_backward_n128_k3_d256_available_cuda(
-                go,
-                h,
-                kc,
-                mix,
-                off,
-                dilation
-            );
-
-        case FDCBackwardPlan::N256K3D256:
-            return fdc_backward_n256_k3_d256_available_cuda(
-                go,
-                h,
-                kc,
-                mix,
-                off,
-                dilation
-            );
-
-        case FDCBackwardPlan::N512K3D256:
-            return fdc_backward_n512_k3_d256_available_cuda(
-                go,
-                h,
-                kc,
-                mix,
-                off,
-                dilation
-            );
-
         default:
             return false;
     }
+
+    (void)go;
+    (void)mix;
 }
 
 // ======================================================================================
@@ -513,15 +385,6 @@ static std::vector<torch::Tensor> fdc_run_backward_plan(
     );
 
     switch (plan) {
-        case FDCBackwardPlan::SmallN6K3:
-            return fdc_backward_small_n6k3_cuda(
-                go,
-                h,
-                kc,
-                mix,
-                off
-            );
-
         case FDCBackwardPlan::MidN6K3Warp:
             return fdc_backward_mid_n6k3_warp_cuda(
                 go,
@@ -530,25 +393,6 @@ static std::vector<torch::Tensor> fdc_run_backward_plan(
                 mix,
                 off,
                 s.full4096_offset0_n6
-            );
-
-        case FDCBackwardPlan::BaseN6K3:
-            return fdc_backward_base_n6k3_cuda(
-                go,
-                h,
-                kc,
-                mix,
-                off,
-                s.full4096_offset0_n6
-            );
-
-        case FDCBackwardPlan::BaseN16K3:
-            return fdc_backward_base_n16k3_cuda(
-                go,
-                h,
-                kc,
-                mix,
-                off
             );
 
         case FDCBackwardPlan::ManyNK3D256:
@@ -568,79 +412,6 @@ static std::vector<torch::Tensor> fdc_run_backward_plan(
                 mix,
                 off,
                 dilation
-            );
-
-        case FDCBackwardPlan::FP16GemmExV3:
-            return fdc_backward_fp16_gemmex_v3_cuda(
-                go,
-                h,
-                kc,
-                mix,
-                off,
-                dilation
-            );
-
-        case FDCBackwardPlan::NewGemmNK3D256:
-            return fdc_new_backward_gemm_nk3_d256_cuda(
-                go,
-                h,
-                kc,
-                mix,
-                off
-            );
-
-        case FDCBackwardPlan::N16K3D256:
-            return fdc_backward_n16_k3_d256_cuda(
-                go,
-                h,
-                kc,
-                mix,
-                off
-            );
-
-        case FDCBackwardPlan::N32K3D256:
-            return fdc_backward_n32_k3_d256_cuda(
-                go,
-                h,
-                kc,
-                mix,
-                off
-            );
-
-        case FDCBackwardPlan::N64K3D256:
-            return fdc_backward_n64_k3_d256_cuda(
-                go,
-                h,
-                kc,
-                mix,
-                off
-            );
-
-        case FDCBackwardPlan::N128K3D256:
-            return fdc_backward_n128_k3_d256_cuda(
-                go,
-                h,
-                kc,
-                mix,
-                off
-            );
-
-        case FDCBackwardPlan::N256K3D256:
-            return fdc_backward_n256_k3_d256_cuda(
-                go,
-                h,
-                kc,
-                mix,
-                off
-            );
-
-        case FDCBackwardPlan::N512K3D256:
-            return fdc_backward_n512_k3_d256_cuda(
-                go,
-                h,
-                kc,
-                mix,
-                off
             );
 
         default:
@@ -674,42 +445,6 @@ static FDCBackwardPlan fdc_default_backward_plan(
         return FDCBackwardPlan::ManyNK3D256;
     }
 
-    if (fdc_new_gemm_nk3_d256_available_cuda(
-            h,
-            kc,
-            mix,
-            off,
-            dilation
-        )) {
-        if (s.shape_n16) {
-            return FDCBackwardPlan::NewGemmNK3D256;
-        }
-
-        if (s.shape_n6 && s.is_fp32 && s.T == 4096) {
-            return FDCBackwardPlan::NewGemmNK3D256;
-        }
-
-        if (s.shape_n6 && s.is_fp16 && (s.T == 8192 || s.T == 16384)) {
-            return FDCBackwardPlan::NewGemmNK3D256;
-        }
-
-        if (s.shape_n6 && s.is_bf16 && s.sm < 80 && s.T == 4096) {
-            return FDCBackwardPlan::NewGemmNK3D256;
-        }
-    }
-
-    if (s.is_fp16 && s.shape_n6 && s.T == 8192 && s.sm >= 75) {
-        return FDCBackwardPlan::FP16GemmExV3;
-    }
-
-    if (s.shape_n16 && s.T == 8192) {
-        return FDCBackwardPlan::BaseN16K3;
-    }
-
-    if (s.shape_n6 && s.is_fp32 && (s.T == 4096 || s.T == 8192)) {
-        return FDCBackwardPlan::BaseN6K3;
-    }
-
     if (s.shape_n6 && s.is_bf16 && s.T == 8192) {
         return FDCBackwardPlan::MidN6K3Warp;
     }
@@ -718,15 +453,13 @@ static FDCBackwardPlan fdc_default_backward_plan(
         return FDCBackwardPlan::MidN6K3Warp;
     }
 
-    if (s.shape_n6 && s.T <= 1024) {
-        return FDCBackwardPlan::SmallN6K3;
-    }
-
-    if (s.shape_n6 && s.is_bf16 && s.T == 4096) {
-        return FDCBackwardPlan::SmallN6K3;
+    if (s.shape_n6) {
+        return FDCBackwardPlan::MidN6K3Warp;
     }
 
     return FDCBackwardPlan::Large;
+
+    (void)mix;
 }
 
 // ======================================================================================
@@ -744,20 +477,8 @@ static std::vector<FDCBackwardPlan> fdc_all_candidate_backward_plans(
     std::vector<FDCBackwardPlan> plans;
 
     FDCBackwardPlan all[] = {
-        FDCBackwardPlan::N16K3D256,
-        FDCBackwardPlan::N32K3D256,
-        FDCBackwardPlan::N64K3D256,
-        FDCBackwardPlan::N128K3D256,
-        FDCBackwardPlan::N256K3D256,
-        FDCBackwardPlan::N512K3D256,
-
-        FDCBackwardPlan::NewGemmNK3D256,
         FDCBackwardPlan::ManyNK3D256,
-        FDCBackwardPlan::SmallN6K3,
         FDCBackwardPlan::MidN6K3Warp,
-        FDCBackwardPlan::BaseN6K3,
-        FDCBackwardPlan::BaseN16K3,
-        FDCBackwardPlan::FP16GemmExV3,
         FDCBackwardPlan::Large
     };
 

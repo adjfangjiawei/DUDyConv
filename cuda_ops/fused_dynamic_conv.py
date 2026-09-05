@@ -395,8 +395,6 @@ def fused_dynamic_conv_forward_plan_name(plan_id: int) -> str:
             0: "forward_direct_generic_2d",
             1: "forward_direct_generic_smalln_preload",
             2: "forward_direct_n6k3_d256",
-            3: "forward_direct_n16k3_d256",
-            4: "forward_direct_n6k7_d256",
             5: "forward_direct_n6k3_d512",
             6: "forward_new_gemm_nk3_d256",
         }
@@ -646,13 +644,8 @@ def fused_dynamic_conv_backward_plan_name(plan_id: int) -> str:
     except Exception:
         names = {
             -1: "not_cached",
-            0: "backward_small_n6k3",
             1: "backward_mid_n6k3_warp",
-            2: "backward_base_n6k3",
-            3: "backward_base_n16k3",
             4: "backward_large",
-            5: "backward_fp16_gemmex_v3",
-            6: "backward_new_gemm_nk3_d256",
         }
 
         return names.get(plan_id, f"unknown_plan_{plan_id}")
