@@ -6,6 +6,18 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
+from cuda_ops import (
+    fused_dynamic_conv_chunk,
+    fused_dynamic_conv,
+    fused_dynamic_conv_forward_warmup_chunk,
+    fused_dynamic_conv_forward_cached_plan_chunk,
+    fused_dynamic_conv_forward_clear_warmup_cache,
+    fused_dynamic_conv_forward_plan_name,
+    fused_dynamic_conv_backward_warmup_chunk,
+    fused_dynamic_conv_backward_cached_plan_chunk,
+    fused_dynamic_conv_backward_clear_warmup_cache,
+    fused_dynamic_conv_backward_plan_name,
+)
 
 
 # ============================================================
@@ -56,38 +68,22 @@ class ModelConfig:
     #
     # use_checkpoint=False 且 adaptive_checkpoint=False:
     #   完全关闭 checkpoint。
-    #
-    # 注意：
-    #   这比旧逻辑更灵活。
-    #   旧逻辑是 use_checkpoint=True 就所有 checkpoint 点都开。
-    #   新逻辑默认自动判断，只在激活足够大时才 checkpoint。
     # --------------------------------------------------------
     use_checkpoint: bool = False
 
     # 是否启用自适应 checkpoint。
-    # 默认 True。
-    #
-    # 当 use_checkpoint=False 时生效。
-    # 当 use_checkpoint=True 时，强制 checkpoint，忽略 adaptive_checkpoint。
     adaptive_checkpoint: bool = True
 
     # 自适应 checkpoint 的激活阈值，单位 MB。
-    #
-    # 只有某个 checkpoint 点估算的可节省激活 >= 该阈值时，
-    # 才会实际启用 checkpoint。
     checkpoint_activation_threshold_mb: float = 512.0
 
     # 时间 chunk 大小。
-    # 峰值中间态主要和 [B,D,C,T]、[B,D,T,N,K]、[B,D,T,K] 有关。
     chunk_size: int = 256
 
     # loss logits 分块大小。
     loss_chunk_size: int = 2048
 
     # 动态 kernel 是否在 K 维归一化。
-    # 当前 kernel_generator 已经在 K 维做 softmax。
-    # 因此动态卷积内不会再使用 normalize_kernel，
-    # 否则会破坏 softmax 后的概率分布。
     normalize_kernel: bool = True
 
     # 动态 kernel 初始缩放。
@@ -96,17 +92,44 @@ class ModelConfig:
     # Source 卷积实现方式。
     source_conv_impl: str = "einsum"
 
-    # Source S2 是否启用：
-    # 直接在 source conv 模块内完成：
-    #   source conv -> GELU -> dropout -> source mix -> dropout
-    # 输出 [B,D,T]。
+    # Source S2 是否启用。
     source_fused_mixed: bool = True
 
+    # --------------------------------------------------------
     # 动态卷积实现方式。
-    dynamic_conv_impl: str = "materialized_kernel_stream_x"
+    #
+    # 可选：
+    #   "cuda_fused":
+    #       默认。使用 cuda_ops.fused_dynamic_conv_chunk。
+    #
+    #   "auto":
+    #       CUDA 上使用 cuda_fused，CPU 上使用 materialized_kernel_stream_x。
+    #
+    #   "materialized_kernel_stream_x":
+    #       PyTorch fallback。物化 mixed_btkd，不物化 windows。
+    #
+    #   "stream_k":
+    #       PyTorch 显存安全路径，逐 K offset 流式计算。
+    #
+    #   "materialized_windows":
+    #       调试/对比路径，会物化 windows 和 mixed_kernel。
+    # --------------------------------------------------------
+    dynamic_conv_impl: str = "cuda_fused"
 
     # 保留字段。
     dynamic_conv_tmp_mb_limit: float = 64.0
+
+    # --------------------------------------------------------
+    # CUDA fused dynamic conv warmup 配置。
+    #
+    # warmup 会调用 cuda_ops 中的：
+    #   fused_dynamic_conv_forward_warmup_chunk
+    #   fused_dynamic_conv_backward_warmup_chunk
+    #
+    # 该字段作为默认 repeat。
+    # 外部调用 warmup_cuda_dynamic_conv 时也可以覆盖 repeat。
+    # --------------------------------------------------------
+    cuda_warmup_repeat: int = 3
 
     # --------------------------------------------------------
     # 非线性残差增强项
@@ -121,12 +144,6 @@ class ModelConfig:
 
     # --------------------------------------------------------
     # 是否使用预分配输出张量来收集 chunk 结果。
-    #
-    # 默认 True：
-    #   避免 chunks list + torch.cat 造成完整序列额外复制峰值。
-    #
-    # 如果某些 PyTorch/checkpoint 组合触发 inplace/autograd
-    # 版本计数问题，可以关闭。
     # --------------------------------------------------------
     use_preallocated_chunk_output: bool = True
 
@@ -1181,17 +1198,20 @@ class ChunkedDUnsharedDilatedSourceConv1d(nn.Module):
         """
         估算 source fused mixed 单个 C-block checkpoint 可节省激活。
 
+        当前版本已经删除 source-channel dropout，只保留 post-mix dropout。
+
         source_c_block 内部主要产生：
             preact_c: [B,D,Cc,T]
             GELU 输出: [B,D,Cc,T]
-            dropout 输出/mask: 近似 [B,D,Cc,T]
-            einsum 相关反传保存/中间态
+            einsum/source mix 相关反传保存/中间态
 
         windows: [B,D,T,S] 是 block 外部输入，不计入 checkpoint
         可以节省的内部激活。
 
-        使用保守系数 4.0：
-            estimated = 4 * B * D * Cc * T * bytes
+        旧版本因为存在 source-channel dropout，使用保守系数 4.0。
+        当前删除 source-channel dropout 后，使用系数 3.0：
+
+            estimated = 3 * B * D * Cc * T * bytes
         """
 
         bytes_per_elem = _dtype_nbytes(
@@ -1199,7 +1219,7 @@ class ChunkedDUnsharedDilatedSourceConv1d(nn.Module):
         )
 
         estimated_bytes = (
-            4.0
+            3.0
             * float(B)
             * float(D)
             * float(Cc)
@@ -1210,6 +1230,7 @@ class ChunkedDUnsharedDilatedSourceConv1d(nn.Module):
         return _bytes_to_mb(
             estimated_bytes
         )
+
 
     def _should_checkpoint_source_c_block(
         self,
@@ -1254,7 +1275,7 @@ class ChunkedDUnsharedDilatedSourceConv1d(nn.Module):
         S2 融合路径。
 
         直接完成：
-            source conv -> GELU -> dropout -> source mix -> dropout
+            source conv -> GELU -> source mix -> source_mix_bias -> post-mix dropout
 
         输入：
             x_full: [B,D,L]
@@ -1264,14 +1285,33 @@ class ChunkedDUnsharedDilatedSourceConv1d(nn.Module):
         输出：
             mixed_chunk: [B,D,T]
 
-        当前版本:
-            1. 不再先完整生成 source: [B,D,C,T]。
-            2. 构造 windows: [B,D,T,S]。
-            3. 按 C 分块计算 source conv + activation + dropout + source mix。
-            4. source C-block checkpoint 改为自适应：
-                - force_checkpoint=True 时强制 checkpoint；
-                - adaptive_checkpoint=True 时按估算激活大小判断；
-                - adaptive_checkpoint=False 时关闭。
+        当前版本重要变更：
+            1. 不再保留 source-channel dropout。
+               也就是说，原来的：
+                   source_c = dropout(source_c)
+               已经删除。
+
+            2. 只保留 post-mix dropout：
+                   mixed = post_mix_dropout_module(mixed)
+
+            3. 这样未来 CUDA fused source op 只需要融合：
+                   build_dilated_source_windows 隐式读
+                   source conv
+                   bias
+                   GELU
+                   source channel mix
+                   source_mix_bias
+
+               dropout 仍在 Python 外部执行，不需要 CUDA 实现 dropout，
+               也不需要保存 source-channel dropout mask。
+
+            4. 当前 PyTorch fallback 仍然不物化完整 [B,D,C,T]，
+               而是：
+                   构造 windows: [B,D,T,S]
+                   按 C 分块计算 preact/source/mix。
+
+            5. source C-block checkpoint 仍保留，但估算中已经可以适当降低，
+               因为不再有 source-channel dropout 中间激活。
         """
 
         if x_full.dim() != 3:
@@ -1379,6 +1419,7 @@ class ChunkedDUnsharedDilatedSourceConv1d(nn.Module):
                     windows_ref,
                     weight_ref
                 )
+                # [B,D,Cc,T]
 
                 if bias_ref is not None:
                     preact_c = preact_c + bias_ref.view(
@@ -1391,16 +1432,29 @@ class ChunkedDUnsharedDilatedSourceConv1d(nn.Module):
                 source_c = activation(
                     preact_c
                 )
+                # [B,D,Cc,T]
 
-                source_c = dropout_module(
-                    source_c
-                )
+                # 重要：
+                #   这里不再执行 source-channel dropout。
+                #
+                # 旧逻辑是：
+                #   source_c = dropout_module(source_c)
+                #
+                # 现在删除它，只保留后面的 post-mix dropout。
+                #
+                # 这样语义变为：
+                #   mixed = post_dropout(
+                #       source_mix(
+                #           GELU(source_conv(windows))
+                #       )
+                #   )
 
                 mixed_c = torch.einsum(
                     "bdct,dc->bdt",
                     source_c,
                     mix_ref
                 )
+                # [B,D,T]
 
                 return mixed_c
 
@@ -1445,12 +1499,15 @@ class ChunkedDUnsharedDilatedSourceConv1d(nn.Module):
             1
         )
 
+        # 只保留 post-mix dropout。
         mixed = post_mix_dropout_module(
             mixed
         )
 
-        return mixed
+        # dropout_module 参数保留但不使用，用于兼容旧调用签名。
+        _ = dropout_module
 
+        return mixed
 
 # 为了兼容旧名称，保留别名。
 # 如果外部代码仍然引用 ChunkedDSharedDilatedSourceConv1d，
@@ -1537,7 +1594,7 @@ class StreamingKernelGenConv1d(nn.Module):
         mixed_source_chunk/full: [B,D,T] 或 [B,D,L]
 
     输出:
-        kernel_chunk: [B,T,N,K]
+        kernel_chunk: [B,K,N,T]
 
     语义:
         1. 先对 D 维做逐 token mix:
@@ -1562,22 +1619,30 @@ class StreamingKernelGenConv1d(nn.Module):
                logits_chunk = identity_chunk + depthwise_conv(LN(local_segment))
 
         5. reshape:
-               [B,N*K,T] -> [B,N,K,T] -> [B,T,N,K]
+               [B,N*K,T] -> [B,N,K,T]
 
-        6. 在 K 维 softmax:
-               kernel = softmax(kernel, dim=-1)
+        6. 在 K 维 softmax。
 
-    当前性能优化:
-        _apply_norm_bct 中去掉 transpose 后的第一次 contiguous。
+        7. 转为 CUDA fused dynamic conv 使用的新布局:
+               [B,N,K,T] -> flip(K) -> [B,K,N,T]
 
-        原来:
-            y = x.transpose(1, 2).contiguous()
+    重要语义对齐:
+        旧 Python 路径中:
+            r = K - 1 表示当前位置
+            offset = K - 1 - r
 
-        现在:
-            y = x.transpose(1, 2)
+        新 CUDA 路径中:
+            kk = 0 表示当前位置
+            src_t = t - kk * dilation
 
-        对 D=1024,N*K=8192,T=32768 的配置，
-        这可以减少一次约 512MB 的大拷贝。
+        所以这里必须把 K 维反转:
+            new_kk = K - 1 - old_r
+
+        最终:
+            kernel[:, 0, :, t] 表示当前位置权重
+            kernel[:, 1, :, t] 表示上一位置权重
+            kernel[:, 2, :, t] 表示上上位置权重
+            ...
     """
 
     def __init__(
@@ -1714,22 +1779,12 @@ class StreamingKernelGenConv1d(nn.Module):
         性能优化:
             去掉 transpose 后的第一次 contiguous。
 
-            旧写法:
-                y = x.transpose(1, 2).contiguous()
-                y = self.norm(y)
-                y = y.transpose(1, 2).contiguous()
+            y = x.transpose(1, 2)
+            y = self.norm(y)
+            y = y.transpose(1, 2).contiguous()
 
-            新写法:
-                y = x.transpose(1, 2)
-                y = self.norm(y)
-                y = y.transpose(1, 2).contiguous()
-
-            LayerNorm 可以接受非 contiguous 的 [B,T,M] view。
-            最后仍然 contiguous 回 [B,M,T]，供后续 Conv1d 使用。
-
-        对当前大配置:
-            x: [1,8192,32768]
-            单次 contiguous copy 约 512MB。
+        LayerNorm 可以接受非 contiguous 的 [B,T,M] view。
+        最后仍然 contiguous 回 [B,M,T]，供后续 Conv1d 使用。
         """
 
         if x.dim() != 3:
@@ -1773,7 +1828,25 @@ class StreamingKernelGenConv1d(nn.Module):
             logits: [B,N*K,T]
 
         输出:
-            kernel: [B,T,N,K]
+            kernel: [B,K,N,T]
+
+        关键:
+            为了和 CUDA fused dynamic conv 的 kk 语义一致，
+            这里会反转 K 维。
+
+        旧 Python 语义:
+            old_r = K - 1 是当前位置
+            old_r = K - 2 是上一位置
+            ...
+
+        新 CUDA 语义:
+            kk = 0 是当前位置
+            kk = 1 是上一位置
+            ...
+
+        因此:
+            kernel_bknt[:, kk, :, :] =
+                old_kernel_bnkt[:, :, K - 1 - kk, :]
         """
 
         if logits.dim() != 3:
@@ -1803,18 +1876,26 @@ class StreamingKernelGenConv1d(nn.Module):
         )
         # [B,N,K,T]
 
+        y = F.softmax(
+            y,
+            dim=2
+        )
+        # [B,N,K,T]，在 K 维归一化
+
+        y = torch.flip(
+            y,
+            dims=[2]
+        )
+        # [B,N,K,T]
+        # K 维反转，使 kk=0 表示当前位置
+
         kernel = y.permute(
             0,
-            3,
+            2,
             1,
-            2
+            3
         ).contiguous()
-        # [B,T,N,K]
-
-        kernel = F.softmax(
-            kernel,
-            dim=-1
-        )
+        # [B,K,N,T]
 
         return kernel
 
@@ -1828,7 +1909,7 @@ class StreamingKernelGenConv1d(nn.Module):
             x_padded: [B,D,pad+T]
 
         输出:
-            kernel: [B,T,N,K]
+            kernel: [B,K,N,T]
 
         计算:
             1. D-mix:
@@ -1846,8 +1927,8 @@ class StreamingKernelGenConv1d(nn.Module):
                    identity = u_padded[:, :, -T:]
                    logits = identity + conv_out
 
-            5. reshape + softmax:
-                   [B,N*K,T] -> [B,T,N,K]
+            5. reshape + softmax + K 维反转:
+                   [B,N*K,T] -> [B,K,N,T]
         """
 
         if x_padded.dim() != 3:
@@ -1915,6 +1996,7 @@ class StreamingKernelGenConv1d(nn.Module):
             logits=logits,
             expected_T=T
         )
+        # [B,K,N,T]
 
         return kernel
 
@@ -1932,7 +2014,7 @@ class StreamingKernelGenConv1d(nn.Module):
                 None 或 [B,D,1,padding_left]
 
         输出:
-            kernel:    [B,T,N,K]
+            kernel:    [B,K,N,T]
             new_cache: [B,D,1,padding_left]
         """
 
@@ -1986,6 +2068,7 @@ class StreamingKernelGenConv1d(nn.Module):
             x_padded=x_padded,
             expected_T=T
         )
+        # [B,K,N,T]
 
         if self.padding_left > 0:
             new_cache_flat = x_padded[
@@ -2022,7 +2105,7 @@ class StreamingKernelGenConv1d(nn.Module):
             end: 当前 chunk 终点
 
         输出:
-            kernel: [B,T,N,K]
+            kernel: [B,K,N,T]
 
         语义:
             与完整序列计算等价。
@@ -2104,9 +2187,9 @@ class StreamingKernelGenConv1d(nn.Module):
             x_padded=segment,
             expected_T=T
         )
+        # [B,K,N,T]
 
         return kernel
-
 
 def build_local_norm_segment_for_causal_windows(
     x_full: torch.Tensor,
@@ -2188,40 +2271,29 @@ class ChunkedUnsharedDynamicConvLayer(nn.Module):
 
     输入：
         h_full:       [B,D,L]
-        kernel_chunk: [B,T,N,K]
+        kernel_chunk: [B,K,N,T]
 
     输出：
         h_chunk_out: [B,D,T]
 
     当前版本:
         1. kernel_generator 输出的动态卷积核不带 D 维:
-               [B,T,N,K]
+               [B,K,N,T]
 
         2. kernel_mix 保持 [D,N]。
 
-        3. stream_k 路径:
-               不物化完整 [B,D,T,K]。
-               每个 K offset 单独计算:
-                   kernel_r: [B,T,N]
-                   mixed_r = kernel_r @ kernel_mix.T -> [B,T,D] -> [B,D,T]
+        3. 新布局与 CUDA fused dynamic conv 一致:
+               kernel_chunk[b, kk, n, t]
 
-        4. materialized_kernel_stream_x 路径:
-               新增性能路径。
-               一次性物化:
-                   mixed_btkd: [B,T,K,D]
+           其中:
+               kk = 0 表示当前位置
+               kk = 1 表示上一位置
+               kk = 2 表示上上位置
 
-               但不物化:
-                   windows: [B,D,T,K]
+        4. 默认 dynamic_conv_impl="cuda_fused"：
+               使用 cuda_ops.fused_dynamic_conv_chunk。
 
-               这样把 K 次 matmul 合并成一次 batched matmul，
-               用约 [B,T,K,D] 的额外显存换性能。
-
-        5. materialized_windows 路径:
-               调试/对比路径。
-               会同时物化:
-                   windows:      [B,D,T,K]
-                   mixed_kernel: [B,D,T,K]
-               大配置下不建议默认使用。
+        5. 提供 warmup_cuda_dynamic_conv，可供外部模型 warmup 调用。
     """
 
     def __init__(
@@ -2233,7 +2305,7 @@ class ChunkedUnsharedDynamicConvLayer(nn.Module):
         dropout: float,
         normalize_kernel: bool = True,
         initial_scale: float = 0.1,
-        dynamic_conv_impl: str = "stream_k",
+        dynamic_conv_impl: str = "cuda_fused",
         dynamic_conv_tmp_mb_limit: float = 64.0,
         use_nonlinear_residual: bool = False,
         nonlinear_residual_initial_scale: float = 0.0,
@@ -2254,13 +2326,15 @@ class ChunkedUnsharedDynamicConvLayer(nn.Module):
             raise ValueError("mlp_ratio 必须为正数。")
 
         if dynamic_conv_impl not in (
+            "cuda_fused",
             "stream_k",
             "materialized_kernel_stream_x",
             "materialized_windows",
             "auto"
         ):
             raise ValueError(
-                f"dynamic_conv_impl 必须为 'stream_k'、"
+                f"dynamic_conv_impl 必须为 'cuda_fused'、"
+                f"'stream_k'、"
                 f"'materialized_kernel_stream_x'、"
                 f"'materialized_windows' 或 'auto'，但得到 {dynamic_conv_impl}"
             )
@@ -2359,10 +2433,16 @@ class ChunkedUnsharedDynamicConvLayer(nn.Module):
 
         当前默认不会调用它，因为 kernel_generator 已经在 K 维做 softmax。
         保留该函数用于兼容旧实验或未来切换非 softmax kernel。
+
+        输入:
+            kernel: [B,K,N,T]
+
+        输出:
+            kernel: [B,K,N,T]
         """
 
         mean = kernel.mean(
-            dim=-1,
+            dim=1,
             keepdim=True
         )
 
@@ -2371,7 +2451,7 @@ class ChunkedUnsharedDynamicConvLayer(nn.Module):
         ).pow(
             2
         ).mean(
-            dim=-1,
+            dim=1,
             keepdim=True
         )
 
@@ -2397,7 +2477,10 @@ class ChunkedUnsharedDynamicConvLayer(nn.Module):
             [B,D,L]
 
         kernel_chunk:
-            [B,T,N,K]
+            [B,K,N,T]
+
+        返回:
+            B, D, L, T, N, K
         """
 
         if h_full.dim() != 3:
@@ -2407,7 +2490,7 @@ class ChunkedUnsharedDynamicConvLayer(nn.Module):
 
         if kernel_chunk.dim() != 4:
             raise ValueError(
-                f"kernel_chunk 应为 [B,T,N,K]，但得到 {kernel_chunk.shape}"
+                f"kernel_chunk 应为 [B,K,N,T]，但得到 {kernel_chunk.shape}"
             )
 
         B, D, L = h_full.shape
@@ -2427,13 +2510,14 @@ class ChunkedUnsharedDynamicConvLayer(nn.Module):
 
         T = end_i - start_i
 
-        Bk, Tk, N, K = kernel_chunk.shape
+        Bk, K, N, Tk = kernel_chunk.shape
 
         if Bk != B or Tk != T:
             raise ValueError(
                 f"kernel_chunk shape 与 h_full/chunk 不匹配，"
                 f"h_full={h_full.shape}, start={start_i}, end={end_i}, "
-                f"kernel_chunk={kernel_chunk.shape}"
+                f"kernel_chunk={kernel_chunk.shape}，"
+                f"期望 kernel_chunk=[{B},{self.dynamic_kernel_size},{self.num_kernels},{T}]"
             )
 
         if N != self.num_kernels:
@@ -2456,25 +2540,21 @@ class ChunkedUnsharedDynamicConvLayer(nn.Module):
         融合完整 N 维。
 
         输入：
-            kernel_chunk: [B,T,N,K]
+            kernel_chunk: [B,K,N,T]
 
         参数：
             kernel_mix: [D,N]
 
         输出：
             mixed_kernel: [B,D,T,K]
-
-        注意：
-            该函数会生成完整 [B,D,T,K]。
-            大配置下不建议默认调用。
         """
 
         if kernel_chunk.dim() != 4:
             raise ValueError(
-                f"kernel_chunk 应为 [B,T,N,K]，但得到 {kernel_chunk.shape}"
+                f"kernel_chunk 应为 [B,K,N,T]，但得到 {kernel_chunk.shape}"
             )
 
-        B, T, N, K = kernel_chunk.shape
+        B, K, N, T = kernel_chunk.shape
 
         if N != self.num_kernels:
             raise ValueError(
@@ -2486,25 +2566,28 @@ class ChunkedUnsharedDynamicConvLayer(nn.Module):
                 f"dynamic_kernel_size 不匹配，期望 {self.dynamic_kernel_size}，实际 {K}"
             )
 
-        mixed_btkd = torch.matmul(
-            kernel_chunk.permute(
-                0,
-                1,
-                3,
-                2
-            ).contiguous(),
+        kernel_bktn = kernel_chunk.permute(
+            0,
+            1,
+            3,
+            2
+        ).contiguous()
+        # [B,K,T,N]
+
+        mixed_bktd = torch.matmul(
+            kernel_bktn,
             self.kernel_mix.transpose(
                 0,
                 1
             )
         )
-        # [B,T,K,D]
+        # [B,K,T,D]
 
-        mixed_kernel = mixed_btkd.permute(
+        mixed_kernel = mixed_bktd.permute(
             0,
             3,
-            1,
-            2
+            2,
+            1
         ).contiguous()
         # [B,D,T,K]
 
@@ -2512,48 +2595,41 @@ class ChunkedUnsharedDynamicConvLayer(nn.Module):
 
     def _mix_kernel_single_offset(
         self,
-        kernel_r: torch.Tensor
+        kernel_kk: torch.Tensor
     ) -> torch.Tensor:
         """
         融合单个 K offset 的 N 维。
 
         输入:
-            kernel_r: [B,T,N]
+            kernel_kk: [B,N,T]
 
         参数:
             kernel_mix: [D,N]
 
         输出:
             mixed_r: [B,D,T]
-
-        计算:
-            mixed_r[b,d,t] =
-                sum_n kernel_r[b,t,n] * kernel_mix[d,n]
-
-        实现:
-            使用标准 matmul:
-
-                [B,T,N] @ [N,D] -> [B,T,D]
-                transpose -> [B,D,T]
-
-        该路径不会生成:
-            [B,D,T,K]
         """
 
-        if kernel_r.dim() != 3:
+        if kernel_kk.dim() != 3:
             raise ValueError(
-                f"kernel_r 应为 [B,T,N]，但得到 {kernel_r.shape}"
+                f"kernel_kk 应为 [B,N,T]，但得到 {kernel_kk.shape}"
             )
 
-        B, T, N = kernel_r.shape
+        B, N, T = kernel_kk.shape
 
         if N != self.num_kernels:
             raise ValueError(
-                f"kernel_r 的 N 维错误，期望 {self.num_kernels}，实际 {N}"
+                f"kernel_kk 的 N 维错误，期望 {self.num_kernels}，实际 {N}"
             )
 
+        kernel_btn = kernel_kk.transpose(
+            1,
+            2
+        ).contiguous()
+        # [B,T,N]
+
         mixed_btd = torch.matmul(
-            kernel_r,
+            kernel_btn,
             self.kernel_mix.transpose(
                 0,
                 1
@@ -2577,17 +2653,7 @@ class ChunkedUnsharedDynamicConvLayer(nn.Module):
         end: int
     ) -> torch.Tensor:
         """
-        默认显存安全 stream_k 路径。
-
-        不显式构造:
-            windows:      [B,D,T,K]
-            mixed_kernel: [B,D,T,K]
-
-        每个 offset r 内部只构造:
-            x_r:     [B,D,T]
-            mixed_r: [B,D,T]
-
-        mixed_r 使用标准 matmul 计算。
+        显存安全 stream_k 路径。
         """
 
         B, D, L, T, N, K = self._validate_kernel_shape(
@@ -2625,9 +2691,8 @@ class ChunkedUnsharedDynamicConvLayer(nn.Module):
             dtype=torch.long
         )
 
-        for r in range(K):
-            offset = K - 1 - r
-            global_idx = t - offset
+        for kk in range(K):
+            global_idx = t - kk
             valid = global_idx >= 0
 
             if valid.any():
@@ -2638,7 +2703,7 @@ class ChunkedUnsharedDynamicConvLayer(nn.Module):
                     max=S - 1
                 )
 
-                x_r = segment_norm.index_select(
+                x_kk = segment_norm.index_select(
                     dim=-1,
                     index=local_idx_clamped
                 )
@@ -2652,26 +2717,26 @@ class ChunkedUnsharedDynamicConvLayer(nn.Module):
                     T
                 )
 
-                x_r = x_r * mask
+                x_kk = x_kk * mask
 
-                kernel_r = kernel_chunk[
+                kernel_kk = kernel_chunk[
                     :,
+                    kk,
                     :,
-                    :,
-                    r
+                    :
                 ]
-                # [B,T,N]
+                # [B,N,T]
 
-                mixed_r = self._mix_kernel_single_offset(
-                    kernel_r=kernel_r
+                mixed_kk = self._mix_kernel_single_offset(
+                    kernel_kk=kernel_kk
                 )
                 # [B,D,T]
 
-                out = out + x_r * mixed_r
+                out = out + x_kk * mixed_kk
 
-                del x_r
-                del kernel_r
-                del mixed_r
+                del x_kk
+                del kernel_kk
+                del mixed_kk
 
         del segment_norm
         del t
@@ -2688,52 +2753,7 @@ class ChunkedUnsharedDynamicConvLayer(nn.Module):
         end: int
     ) -> torch.Tensor:
         """
-        折中性能路径。
-
-        物化:
-            mixed_btkd: [B,T,K,D]
-
-        不物化:
-            windows: [B,D,T,K]
-
-        输入:
-            h_full:       [B,D,L]
-            kernel_chunk: [B,T,N,K]
-
-        输出:
-            out: [B,D,T]
-
-        核心思想:
-            原 stream_k 路径中，每个 K offset 都会做一次:
-
-                kernel_r: [B,T,N]
-                kernel_mix.T: [N,D]
-                mixed_r = kernel_r @ kernel_mix.T
-                mixed_r: [B,T,D] -> [B,D,T]
-
-            K=32 时就是 32 次 matmul。
-
-            本路径一次性做:
-
-                kernel_btnk = kernel_chunk.permute(0,1,3,2)
-                [B,T,K,N]
-
-                mixed_btkd = kernel_btnk @ kernel_mix.T
-                [B,T,K,D]
-
-            然后仍然逐 K offset gather x_r 并累加:
-
-                out += x_r * mixed_btkd[:, :, r, :].transpose(1,2)
-
-        当前大配置显存:
-            B=1,T=32768,K=32,D=1024
-
-            mixed_btkd:
-                [1,32768,32,1024]
-                bf16 约 2GB
-
-        比完整 materialized_windows 更安全，因为不额外物化:
-            windows: [B,D,T,K]，同样约 2GB。
+        折中性能 PyTorch 路径。
         """
 
         B, D, L, T, N, K = self._validate_kernel_shape(
@@ -2764,24 +2784,33 @@ class ChunkedUnsharedDynamicConvLayer(nn.Module):
             T
         )
 
-        kernel_btnk = kernel_chunk.permute(
+        kernel_bktn = kernel_chunk.permute(
             0,
             1,
             3,
             2
         ).contiguous()
-        # [B,T,K,N]
+        # [B,K,T,N]
 
-        mixed_btkd = torch.matmul(
-            kernel_btnk,
+        mixed_bktd = torch.matmul(
+            kernel_bktn,
             self.kernel_mix.transpose(
                 0,
                 1
             )
         )
+        # [B,K,T,D]
+
+        mixed_btkd = mixed_bktd.permute(
+            0,
+            2,
+            1,
+            3
+        ).contiguous()
         # [B,T,K,D]
 
-        del kernel_btnk
+        del kernel_bktn
+        del mixed_bktd
 
         t = torch.arange(
             start_i,
@@ -2790,9 +2819,8 @@ class ChunkedUnsharedDynamicConvLayer(nn.Module):
             dtype=torch.long
         )
 
-        for r in range(K):
-            offset = K - 1 - r
-            global_idx = t - offset
+        for kk in range(K):
+            global_idx = t - kk
             valid = global_idx >= 0
 
             if valid.any():
@@ -2803,7 +2831,7 @@ class ChunkedUnsharedDynamicConvLayer(nn.Module):
                     max=S - 1
                 )
 
-                x_r = segment_norm.index_select(
+                x_kk = segment_norm.index_select(
                     dim=-1,
                     index=local_idx_clamped
                 )
@@ -2817,23 +2845,23 @@ class ChunkedUnsharedDynamicConvLayer(nn.Module):
                     T
                 )
 
-                x_r = x_r * mask
+                x_kk = x_kk * mask
 
-                mixed_r = mixed_btkd[
+                mixed_kk = mixed_btkd[
                     :,
                     :,
-                    r,
+                    kk,
                     :
                 ].transpose(
                     1,
                     2
                 )
-                # [B,D,T] view，通常不强制 contiguous
+                # [B,D,T] view
 
-                out = out + x_r * mixed_r
+                out = out + x_kk * mixed_kk
 
-                del x_r
-                del mixed_r
+                del x_kk
+                del mixed_kk
 
         del mixed_btkd
         del segment_norm
@@ -2852,13 +2880,6 @@ class ChunkedUnsharedDynamicConvLayer(nn.Module):
     ) -> torch.Tensor:
         """
         调试/对比路径。
-
-        显式构造:
-            windows:      [B,D,T,K]
-            mixed_kernel: [B,D,T,K]
-
-        该路径不是默认推荐路径。
-        大配置下会额外占用较多显存。
         """
 
         B, D, L, T, N, K = self._validate_kernel_shape(
@@ -2896,9 +2917,8 @@ class ChunkedUnsharedDynamicConvLayer(nn.Module):
             dtype=torch.long
         )
 
-        for r in range(K):
-            offset = K - 1 - r
-            global_idx = t - offset
+        for kk in range(K):
+            global_idx = t - kk
             valid = global_idx >= 0
 
             if valid.any():
@@ -2909,7 +2929,7 @@ class ChunkedUnsharedDynamicConvLayer(nn.Module):
                     max=S - 1
                 )
 
-                x_r = segment_norm.index_select(
+                x_kk = segment_norm.index_select(
                     dim=-1,
                     index=local_idx_clamped
                 )
@@ -2927,10 +2947,10 @@ class ChunkedUnsharedDynamicConvLayer(nn.Module):
                     :,
                     :,
                     :,
-                    r
-                ] = x_r * mask
+                    kk
+                ] = x_kk * mask
 
-                del x_r
+                del x_kk
 
         mixed_kernel = self._mix_kernel_n_dimension(
             kernel_chunk=kernel_chunk
@@ -2951,6 +2971,113 @@ class ChunkedUnsharedDynamicConvLayer(nn.Module):
 
         return out
 
+    def _apply_dynamic_conv_cuda_fused(
+        self,
+        h_full: torch.Tensor,
+        kernel_chunk: torch.Tensor,
+        start: int,
+        end: int
+    ) -> torch.Tensor:
+        """
+        CUDA fused dynamic conv 路径。
+
+        dtype 决策：
+            以 h_full.dtype 为准。
+            kernel_chunk 和 kernel_mix 在调用前显式转换到 h_full.dtype。
+
+        第一次调用时会打印实际进入 CUDA op 的 dtype。
+        """
+
+        B, D, L, T, N, K = self._validate_kernel_shape(
+            h_full=h_full,
+            kernel_chunk=kernel_chunk,
+            start=start,
+            end=end
+        )
+
+        if not h_full.is_cuda:
+            raise RuntimeError(
+                "dynamic_conv_impl='cuda_fused' 只能在 CUDA tensor 上使用。"
+                "如果需要 CPU fallback，请设置 dynamic_conv_impl='auto' 或 "
+                "'materialized_kernel_stream_x'。"
+            )
+
+        try:
+            from cuda_ops import fused_dynamic_conv_chunk
+        except Exception as e:
+            raise RuntimeError(
+                "dynamic_conv_impl='cuda_fused' 需要 cuda_ops 可导入，"
+                "并且 cuda_ops 中必须提供 fused_dynamic_conv_chunk。"
+            ) from e
+
+        if not hasattr(self, "_debug_cuda_op_dtype_printed"):
+            self._debug_cuda_op_dtype_printed = False
+
+        debug_print = not self._debug_cuda_op_dtype_printed
+
+        if debug_print:
+            print("=" * 80)
+            print("CUDA fused dynamic conv dtype BEFORE cast")
+            print(f"h_full.dtype:       {h_full.dtype}")
+            print(f"kernel_chunk.dtype: {kernel_chunk.dtype}")
+            print(f"kernel_mix.dtype:   {self.kernel_mix.dtype}")
+            print(f"kernel_scale.dtype: {self.kernel_scale.dtype}")
+            print(f"h_full.shape:       {tuple(h_full.shape)}")
+            print(f"kernel_chunk.shape: {tuple(kernel_chunk.shape)}")
+            print(f"kernel_mix.shape:   {tuple(self.kernel_mix.shape)}")
+            print(f"start:              {int(start)}")
+            print(f"end:                {int(end)}")
+            print(f"T:                  {int(T)}")
+            print(f"device:             {h_full.device}")
+            print("=" * 80)
+
+        target_dtype = h_full.dtype
+
+        h_full_contig = h_full.contiguous()
+
+        if kernel_chunk.dtype != target_dtype:
+            kernel_chunk_for_op = kernel_chunk.to(
+                dtype=target_dtype
+            ).contiguous()
+        else:
+            kernel_chunk_for_op = kernel_chunk.contiguous()
+
+        if self.kernel_mix.dtype != target_dtype:
+            kernel_mix_for_op = self.kernel_mix.to(
+                dtype=target_dtype
+            ).contiguous()
+        else:
+            kernel_mix_for_op = self.kernel_mix.contiguous()
+
+        if debug_print:
+            print("=" * 80)
+            print("CUDA fused dynamic conv dtype SENT TO OP")
+            print(f"h_full_contig.dtype:       {h_full_contig.dtype}")
+            print(f"kernel_chunk_for_op.dtype: {kernel_chunk_for_op.dtype}")
+            print(f"kernel_mix_for_op.dtype:   {kernel_mix_for_op.dtype}")
+            print(f"h_full_contig.shape:       {tuple(h_full_contig.shape)}")
+            print(f"kernel_chunk_for_op.shape: {tuple(kernel_chunk_for_op.shape)}")
+            print(f"kernel_mix_for_op.shape:   {tuple(kernel_mix_for_op.shape)}")
+            print(f"target_dtype:              {target_dtype}")
+            print("=" * 80)
+
+            self._debug_cuda_op_dtype_printed = True
+
+        out = fused_dynamic_conv_chunk(
+            h_full=h_full_contig,
+            kernel_chunk=kernel_chunk_for_op,
+            kernel_mix=kernel_mix_for_op,
+            t_offset=int(start),
+            dilation=1,
+        )
+
+        out = out * self.kernel_scale.to(
+            dtype=out.dtype
+        )
+
+        return out
+
+
     def _apply_dynamic_conv(
         self,
         h_full: torch.Tensor,
@@ -2959,6 +3086,14 @@ class ChunkedUnsharedDynamicConvLayer(nn.Module):
         end: int
     ) -> torch.Tensor:
         impl = self.dynamic_conv_impl
+
+        if impl == "cuda_fused":
+            return self._apply_dynamic_conv_cuda_fused(
+                h_full=h_full,
+                kernel_chunk=kernel_chunk,
+                start=start,
+                end=end
+            )
 
         if impl == "stream_k":
             return self._apply_dynamic_conv_stream_k(
@@ -2985,6 +3120,14 @@ class ChunkedUnsharedDynamicConvLayer(nn.Module):
             )
 
         if impl == "auto":
+            if h_full.is_cuda:
+                return self._apply_dynamic_conv_cuda_fused(
+                    h_full=h_full,
+                    kernel_chunk=kernel_chunk,
+                    start=start,
+                    end=end
+                )
+
             return self._apply_dynamic_conv_materialized_kernel_stream_x(
                 h_full=h_full,
                 kernel_chunk=kernel_chunk,
@@ -2996,6 +3139,329 @@ class ChunkedUnsharedDynamicConvLayer(nn.Module):
             f"未知 dynamic_conv_impl: {impl}"
         )
 
+    @torch.no_grad()
+    def warmup_cuda_dynamic_conv(
+        self,
+        batch_size: int,
+        seq_len: int,
+        chunk_size: int,
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
+        repeat: int = 3,
+        include_backward: bool = True,
+        clear_existing_cache: bool = False,
+        warmup_all_chunks: bool = False
+    ) -> List[dict]:
+        """
+        对本 dynamic layer 使用的 CUDA fused dynamic conv 进行 warmup。
+
+        外部可调用。
+
+        参数:
+            batch_size:
+                B。
+
+            seq_len:
+                L。
+
+            chunk_size:
+                T 的最大 chunk 大小。
+
+            device:
+                CUDA device。默认取本层参数所在 device。
+
+            dtype:
+                warmup dtype。默认取 kernel_mix.dtype。
+
+            repeat:
+                cuda_ops warmup repeat。
+
+            include_backward:
+                是否同时 warmup backward plan。
+
+            clear_existing_cache:
+                是否先清空 cuda_ops 里的 forward/backward warmup cache。
+
+            warmup_all_chunks:
+                False:
+                    只 warmup 代表性 chunk：
+                        start=0
+                        start=max(0, L - T)
+                    以及最后短 chunk，如果存在。
+                True:
+                    对实际所有 chunk 的 t_offset/T 组合 warmup。
+                    长序列下可能较慢。
+
+        返回:
+            List[dict]，每个元素包含当前 chunk 的 plan 信息。
+        """
+
+        if batch_size <= 0:
+            raise ValueError("batch_size 必须为正数。")
+
+        if seq_len <= 0:
+            raise ValueError("seq_len 必须为正数。")
+
+        if chunk_size <= 0:
+            raise ValueError("chunk_size 必须为正数。")
+
+        if repeat <= 0:
+            raise ValueError("repeat 必须为正数。")
+
+        if device is None:
+            device = self.kernel_mix.device
+
+        device = torch.device(
+            device
+        )
+
+        if device.type != "cuda":
+            raise RuntimeError(
+                "warmup_cuda_dynamic_conv 需要 CUDA device。"
+            )
+
+        if dtype is None:
+            dtype = self.kernel_mix.dtype
+
+        try:
+            from cuda_ops import (
+                fused_dynamic_conv_forward_warmup_chunk,
+                fused_dynamic_conv_forward_cached_plan_chunk,
+                fused_dynamic_conv_forward_clear_warmup_cache,
+                fused_dynamic_conv_forward_plan_name,
+                fused_dynamic_conv_backward_warmup_chunk,
+                fused_dynamic_conv_backward_cached_plan_chunk,
+                fused_dynamic_conv_backward_clear_warmup_cache,
+                fused_dynamic_conv_backward_plan_name,
+            )
+        except Exception as e:
+            raise RuntimeError(
+                "warmup_cuda_dynamic_conv 需要 cuda_ops 可导入，并且提供 "
+                "fused_dynamic_conv_forward_warmup_chunk、"
+                "fused_dynamic_conv_backward_warmup_chunk 等 warmup API。"
+            ) from e
+
+        if clear_existing_cache:
+            fused_dynamic_conv_forward_clear_warmup_cache()
+
+            if include_backward:
+                fused_dynamic_conv_backward_clear_warmup_cache()
+
+        B = int(
+            batch_size
+        )
+
+        D = int(
+            self.embed_dim
+        )
+
+        L = int(
+            seq_len
+        )
+
+        N = int(
+            self.num_kernels
+        )
+
+        K = int(
+            self.dynamic_kernel_size
+        )
+
+        step = max(
+            1,
+            int(chunk_size)
+        )
+
+        if warmup_all_chunks:
+            chunk_ranges = []
+
+            for start in range(0, L, step):
+                end = min(
+                    start + step,
+                    L
+                )
+
+                chunk_ranges.append(
+                    (
+                        start,
+                        end
+                    )
+                )
+        else:
+            chunk_ranges = []
+
+            first_start = 0
+            first_end = min(
+                step,
+                L
+            )
+
+            chunk_ranges.append(
+                (
+                    first_start,
+                    first_end
+                )
+            )
+
+            tail_start = max(
+                0,
+                L - step
+            )
+
+            tail_end = L
+
+            if (
+                tail_start,
+                tail_end
+            ) not in chunk_ranges:
+                chunk_ranges.append(
+                    (
+                        tail_start,
+                        tail_end
+                    )
+                )
+
+            remainder = L % step
+
+            if remainder != 0:
+                last_short_start = L - remainder
+                last_short_end = L
+
+                if (
+                    last_short_start,
+                    last_short_end
+                ) not in chunk_ranges:
+                    chunk_ranges.append(
+                        (
+                            last_short_start,
+                            last_short_end
+                        )
+                    )
+
+        results: List[dict] = []
+
+        h_full = torch.empty(
+            B,
+            D,
+            L,
+            device=device,
+            dtype=dtype
+        )
+
+        kernel_mix = self.kernel_mix.detach().to(
+            device=device,
+            dtype=dtype
+        ).contiguous()
+
+        for start, end in chunk_ranges:
+            T = int(
+                end - start
+            )
+
+            if T <= 0:
+                continue
+
+            kernel_chunk = torch.empty(
+                B,
+                K,
+                N,
+                T,
+                device=device,
+                dtype=dtype
+            )
+
+            forward_plan_id = fused_dynamic_conv_forward_warmup_chunk(
+                h_full=h_full,
+                kernel_chunk=kernel_chunk,
+                kernel_mix=kernel_mix,
+                t_offset=int(start),
+                dilation=1,
+                repeat=int(repeat),
+            )
+
+            cached_forward_plan_id = fused_dynamic_conv_forward_cached_plan_chunk(
+                h_full=h_full,
+                kernel_chunk=kernel_chunk,
+                kernel_mix=kernel_mix,
+                t_offset=int(start),
+                dilation=1,
+            )
+
+            if cached_forward_plan_id != forward_plan_id:
+                raise RuntimeError(
+                    f"forward cached plan mismatch: "
+                    f"selected={forward_plan_id}, cached={cached_forward_plan_id}, "
+                    f"start={start}, end={end}, T={T}"
+                )
+
+            item = {
+                "start": int(start),
+                "end": int(end),
+                "T": int(T),
+                "forward_plan_id": int(forward_plan_id),
+                "forward_plan_name": fused_dynamic_conv_forward_plan_name(
+                    int(forward_plan_id)
+                ),
+            }
+
+            if include_backward:
+                grad_out = torch.empty(
+                    B,
+                    D,
+                    T,
+                    device=device,
+                    dtype=dtype
+                )
+
+                backward_plan_id = fused_dynamic_conv_backward_warmup_chunk(
+                    grad_out=grad_out,
+                    h_full=h_full,
+                    kernel_chunk=kernel_chunk,
+                    kernel_mix=kernel_mix,
+                    t_offset=int(start),
+                    dilation=1,
+                    repeat=int(repeat),
+                )
+
+                cached_backward_plan_id = fused_dynamic_conv_backward_cached_plan_chunk(
+                    h_full=h_full,
+                    kernel_chunk=kernel_chunk,
+                    t_offset=int(start),
+                    dilation=1,
+                )
+
+                if cached_backward_plan_id != backward_plan_id:
+                    raise RuntimeError(
+                        f"backward cached plan mismatch: "
+                        f"selected={backward_plan_id}, cached={cached_backward_plan_id}, "
+                        f"start={start}, end={end}, T={T}"
+                    )
+
+                item["backward_plan_id"] = int(
+                    backward_plan_id
+                )
+
+                item["backward_plan_name"] = fused_dynamic_conv_backward_plan_name(
+                    int(backward_plan_id)
+                )
+
+                del grad_out
+
+            results.append(
+                item
+            )
+
+            del kernel_chunk
+
+        del h_full
+        del kernel_mix
+
+        torch.cuda.synchronize(
+            device=device
+        )
+
+        return results
+
     def forward_chunk(
         self,
         h_full: torch.Tensor,
@@ -3003,6 +3469,18 @@ class ChunkedUnsharedDynamicConvLayer(nn.Module):
         start: int,
         end: int
     ) -> torch.Tensor:
+        """
+        单个 dynamic chunk 前向。
+
+        输入:
+            h_full:       [B,D,L]
+            kernel_chunk: [B,K,N,T]
+            start/end:    当前 chunk 的全局时间范围
+
+        输出:
+            h: [B,D,T]
+        """
+
         if h_full.dim() != 3:
             raise ValueError(
                 f"h_full 应为 [B,D,L]，但得到 {h_full.shape}"
@@ -3101,26 +3579,6 @@ class DilatedUnsharedLayer(nn.Module):
     输出:
         next_source_full:  [B,D,L]
         next_dynamic_full: [B,D,L]
-
-    当前版本重点:
-        1. source chunk checkpoint 包住 build_dilated_source_windows，
-           避免 windows [B,D,T,S] 作为 checkpoint 输入长期保存。
-
-        2. dynamic chunk checkpoint 按整层累计激活判断。
-
-        3. forward 新增 disable_inner_checkpoint。
-           当外层 backbone 已经启用 layer-level checkpoint 时，
-           内部 source/dynamic chunk checkpoint 自动禁用，避免嵌套 checkpoint。
-
-    checkpoint 语义:
-        use_checkpoint=True:
-            训练时强制 checkpoint。
-
-        use_checkpoint=False 且 adaptive_checkpoint=True:
-            按估算激活自适应 checkpoint。
-
-        use_checkpoint=False 且 adaptive_checkpoint=False:
-            不 checkpoint。
     """
 
     def __init__(
@@ -3140,7 +3598,7 @@ class DilatedUnsharedLayer(nn.Module):
         use_checkpoint: bool,
         source_conv_impl: str = "einsum",
         source_fused_mixed: bool = True,
-        dynamic_conv_impl: str = "materialized_kernel_stream_x",
+        dynamic_conv_impl: str = "cuda_fused",
         dynamic_conv_tmp_mb_limit: float = 64.0,
         use_nonlinear_residual: bool = False,
         use_source_nonlinear_residual: bool = False,
@@ -3261,6 +3719,35 @@ class DilatedUnsharedLayer(nn.Module):
             nonlinear_residual_bias=nonlinear_residual_bias
         )
 
+    @torch.no_grad()
+    def warmup_cuda_dynamic_conv(
+        self,
+        batch_size: int,
+        seq_len: int,
+        chunk_size: int,
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
+        repeat: int = 3,
+        include_backward: bool = True,
+        clear_existing_cache: bool = False,
+        warmup_all_chunks: bool = False
+    ) -> List[dict]:
+        """
+        对本层里的 dynamic_layer CUDA fused dynamic conv 做 warmup。
+        """
+
+        return self.dynamic_layer.warmup_cuda_dynamic_conv(
+            batch_size=batch_size,
+            seq_len=seq_len,
+            chunk_size=chunk_size,
+            device=device,
+            dtype=dtype,
+            repeat=repeat,
+            include_backward=include_backward,
+            clear_existing_cache=clear_existing_cache,
+            warmup_all_chunks=warmup_all_chunks
+        )
+
     def _num_chunks(
         self,
         L: int,
@@ -3284,6 +3771,22 @@ class DilatedUnsharedLayer(nn.Module):
         T: int,
         dtype: torch.dtype
     ) -> float:
+        """
+        估算 source chunk checkpoint 可节省激活。
+
+        当前 source 路径已经删除 source-channel dropout，只保留 post-mix dropout。
+
+        主要激活估算：
+            windows: [B,D,T,S]
+            source internal:
+                preact/source activation/einsum 相关中间态，约 3 * [B,D,C,T]
+            residual/mixed:
+                [B,D,T]
+
+        旧版本因为存在 source-channel dropout，source_internal_elems 使用 4.0。
+        当前删除 source-channel dropout 后，改为 3.0。
+        """
+
         bytes_per_elem = _dtype_nbytes(
             dtype
         )
@@ -3305,7 +3808,7 @@ class DilatedUnsharedLayer(nn.Module):
         )
 
         source_internal_elems = (
-            4.0
+            3.0
             * float(B)
             * float(D)
             * float(C)
@@ -3333,6 +3836,7 @@ class DilatedUnsharedLayer(nn.Module):
         return _bytes_to_mb(
             estimated_bytes
         )
+
 
     def _should_checkpoint_source_chunk(
         self,
@@ -3417,6 +3921,7 @@ class DilatedUnsharedLayer(nn.Module):
         impl = self.dynamic_conv_impl
 
         if impl in (
+            "cuda_fused",
             "materialized_kernel_stream_x",
             "auto"
         ):
@@ -3526,6 +4031,40 @@ class DilatedUnsharedLayer(nn.Module):
         start: int,
         end: int
     ) -> torch.Tensor:
+        """
+        计算 source mixed chunk。
+
+        当前 source_fused_mixed=True 路径语义：
+
+            source_mixed_chunk =
+                post_mix_dropout(
+                    source_mix(
+                        GELU(
+                            source_conv(source_input_norm_full)
+                        )
+                    )
+                    + source_mix_bias
+                )
+
+        重要变更：
+            不再保留 source-channel dropout。
+
+        也就是说，旧语义：
+
+            source_c = GELU(preact_c)
+            source_c = source_dropout(source_c)
+            mixed = source_mix(source_c)
+            mixed = source_dropout(mixed)
+
+        现在变为：
+
+            source_c = GELU(preact_c)
+            mixed = source_mix(source_c)
+            mixed = source_dropout(mixed)
+
+        这里的 self.source_dropout 只作为 post-mix dropout 使用。
+        """
+
         if self.source_fused_mixed:
             source_mixed_chunk = self.source_conv.forward_mixed_chunk(
                 x_full=source_input_norm_full,
@@ -3550,9 +4089,13 @@ class DilatedUnsharedLayer(nn.Module):
             source_chunk
         )
 
-        source_chunk = self.source_dropout(
-            source_chunk
-        )
+        # 重要：
+        #   非 fused_mixed fallback 路径也同步删除 source-channel dropout。
+        #
+        # 旧逻辑：
+        #   source_chunk = self.source_dropout(source_chunk)
+        #
+        # 现在删除，只保留 source_mix 之后的 post-mix dropout。
 
         source_mixed_chunk = self.source_mix(
             source_chunk
@@ -3563,6 +4106,7 @@ class DilatedUnsharedLayer(nn.Module):
         )
 
         return source_mixed_chunk
+
 
     def _source_chunk_body(
         self,
@@ -4161,7 +4705,6 @@ class DilatedUnsharedLayer(nn.Module):
 
         return next_source_full, next_dynamic_full
 
-
 # ============================================================
 # 13. 多层 backbone
 # ============================================================
@@ -4178,27 +4721,9 @@ class DilatedUnsharedDynamicConvBackbone(nn.Module):
         第 2 层 8
         ...
 
-    当前关键修复:
-        1. layer-level checkpoint 使用 use_reentrant=True。
-           这是长上下文下真正省显存的模式。
-           第一次 forward 不记录整层内部 autograd graph。
-
-        2. 如果 layer-level checkpoint 已触发，
-           调用 layer 时传入 disable_inner_checkpoint=True，
-           避免内部 source/dynamic chunk checkpoint 嵌套。
-
-        3. 如果 layer-level checkpoint 没触发，
-           layer 内部仍然可以按自适应规则开启 source/dynamic chunk checkpoint。
-
-    checkpoint 语义:
-        config.use_checkpoint=True:
-            强制 layer-level checkpoint。
-
-        config.use_checkpoint=False 且 config.adaptive_checkpoint=True:
-            按估算激活自适应开启 layer-level checkpoint。
-
-        config.use_checkpoint=False 且 config.adaptive_checkpoint=False:
-            关闭 layer-level checkpoint。
+    新增:
+        warmup_cuda_dynamic_conv，可从模型外部调用，用于提前 warmup
+        每一层 dynamic_layer 里的 cuda fused dynamic conv plan。
     """
 
     def __init__(self, config: ModelConfig):
@@ -4263,6 +4788,132 @@ class DilatedUnsharedDynamicConvBackbone(nn.Module):
                 layer
             )
 
+    @torch.no_grad()
+    def warmup_cuda_dynamic_conv(
+        self,
+        batch_size: int,
+        seq_len: int,
+        chunk_size: Optional[int] = None,
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
+        repeat: Optional[int] = None,
+        include_backward: bool = True,
+        clear_existing_cache: bool = True,
+        warmup_all_chunks: bool = False
+    ) -> List[dict]:
+        """
+        对 backbone 中所有层的 CUDA fused dynamic conv 做 warmup。
+
+        外部可调用。
+
+        参数:
+            batch_size:
+                B。
+
+            seq_len:
+                L。
+
+            chunk_size:
+                chunk T。默认使用 config.chunk_size。
+
+            device:
+                CUDA device。默认取 backbone 参数所在 device。
+
+            dtype:
+                warmup dtype。默认取 backbone 参数 dtype。
+
+            repeat:
+                warmup repeat。默认使用 config.cuda_warmup_repeat。
+
+            include_backward:
+                是否 warmup backward plan。
+
+            clear_existing_cache:
+                是否清空 cuda_ops 已有 warmup cache。
+                注意只在第 0 层调用时清空，避免每层清一次。
+
+            warmup_all_chunks:
+                是否 warmup 所有 chunk。
+                默认 False，只 warmup 代表性 chunk，速度更快。
+
+        返回:
+            List[dict]，每个元素包含 layer_index 和 plan 信息。
+        """
+
+        if chunk_size is None:
+            chunk_size = int(
+                self.config.chunk_size
+            )
+
+        if repeat is None:
+            repeat = int(
+                getattr(
+                    self.config,
+                    "cuda_warmup_repeat",
+                    3
+                )
+            )
+
+        if device is None:
+            try:
+                device = next(
+                    self.parameters()
+                ).device
+            except StopIteration:
+                device = torch.device(
+                    "cuda"
+                )
+
+        device = torch.device(
+            device
+        )
+
+        if device.type != "cuda":
+            raise RuntimeError(
+                "warmup_cuda_dynamic_conv 需要 CUDA device。"
+            )
+
+        if dtype is None:
+            try:
+                dtype = next(
+                    self.parameters()
+                ).dtype
+            except StopIteration:
+                dtype = torch.float16
+
+        results: List[dict] = []
+
+        for layer_index, layer in enumerate(self.layers):
+            layer_results = layer.warmup_cuda_dynamic_conv(
+                batch_size=batch_size,
+                seq_len=seq_len,
+                chunk_size=chunk_size,
+                device=device,
+                dtype=dtype,
+                repeat=repeat,
+                include_backward=include_backward,
+                clear_existing_cache=(
+                    clear_existing_cache
+                    and layer_index == 0
+                ),
+                warmup_all_chunks=warmup_all_chunks
+            )
+
+            for item in layer_results:
+                item = dict(
+                    item
+                )
+
+                item["layer_index"] = int(
+                    layer_index
+                )
+
+                results.append(
+                    item
+                )
+
+        return results
+
     def _estimate_layer_checkpoint_mb(
         self,
         B: int,
@@ -4272,20 +4923,6 @@ class DilatedUnsharedDynamicConvBackbone(nn.Module):
     ) -> float:
         """
         估算 layer-level checkpoint 可节省激活。
-
-        一个完整状态:
-            [B,D,L]
-
-        对你的配置:
-            B=1,D=256,L=262144,bf16
-
-            [B,D,L]:
-                1 * 256 * 262144 * 2 = 128 MiB
-
-            4 倍:
-                512 MiB
-
-        阈值默认 512MB，所以该配置会触发 layer checkpoint。
         """
 
         bytes_per_elem = _dtype_nbytes(
@@ -4383,7 +5020,6 @@ class DilatedUnsharedDynamicConvBackbone(nn.Module):
 
         return dynamic_h
 
-
 # ============================================================
 # 14. 完整语言模型
 # ============================================================
@@ -4399,45 +5035,9 @@ class DilatedUnsharedDynamicConvLM(nn.Module):
         logits: Optional [B,L,V]
         loss:   Optional scalar
 
-    训练时 targets 不为 None：
-        分块计算 loss，不返回完整 logits。
-
-    当前关键修复：
-        loss chunk 也必须 checkpoint。
-
-    原因：
-        即使 backbone 已经 checkpoint，
-        loss loop 中每个 loss_chunk 都会把 lm_head logits 和
-        cross_entropy 内部 log_softmax 反传激活挂到 total_loss 上。
-
-        对长序列:
-            L = 262144
-            loss_chunk_size = 8192
-            num_loss_chunks = 32
-            vocab_size = 8097
-
-        每个 CE 内部 fp32 buffer:
-            8192 * 8097 * 4 bytes ≈ 253 MiB
-
-        32 个 chunk:
-            253 MiB * 32 ≈ 7.9 GiB
-
-        再加 bf16 logits:
-            8192 * 8097 * 2 bytes ≈ 126 MiB/chunk
-            126 MiB * 32 ≈ 4.0 GiB
-
-        所以 loss graph 本身能吃 8GB~12GB。
-        这就是当前 OOM 的关键点。
-
-    checkpoint 语义：
-        config.use_checkpoint=True:
-            强制 loss chunk checkpoint。
-
-        config.use_checkpoint=False 且 config.adaptive_checkpoint=True:
-            根据整段 loss 累计估算自动 checkpoint。
-
-        config.use_checkpoint=False 且 config.adaptive_checkpoint=False:
-            不 checkpoint。
+    新增:
+        warmup_cuda_dynamic_conv，可从外部直接调用：
+            model.warmup_cuda_dynamic_conv(...)
     """
 
     def __init__(self, config: ModelConfig):
@@ -4526,6 +5126,126 @@ class DilatedUnsharedDynamicConvLM(nn.Module):
         elif isinstance(module, StreamingKernelGenConv1d):
             module.reset_parameters()
 
+    @torch.no_grad()
+    def warmup_cuda_dynamic_conv(
+        self,
+        batch_size: int = 1,
+        seq_len: Optional[int] = None,
+        chunk_size: Optional[int] = None,
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
+        repeat: Optional[int] = None,
+        include_backward: bool = True,
+        clear_existing_cache: bool = True,
+        warmup_all_chunks: bool = False
+    ) -> List[dict]:
+        """
+        对模型内部所有 CUDA fused dynamic conv 层进行 warmup。
+
+        外部调用示例:
+            model = DilatedUnsharedDynamicConvLM(config).cuda().bfloat16()
+
+            warmup_info = model.warmup_cuda_dynamic_conv(
+                batch_size=1,
+                seq_len=config.block_size,
+                chunk_size=config.chunk_size,
+                dtype=torch.bfloat16,
+                repeat=3,
+                include_backward=True,
+                warmup_all_chunks=False
+            )
+
+        参数:
+            batch_size:
+                B，默认 1。
+
+            seq_len:
+                L。默认使用 config.block_size。
+
+            chunk_size:
+                T。默认使用 config.chunk_size。
+
+            device:
+                CUDA device。默认取模型参数所在 device。
+
+            dtype:
+                warmup dtype。默认取模型参数 dtype。
+
+            repeat:
+                warmup repeat。默认使用 config.cuda_warmup_repeat。
+
+            include_backward:
+                是否 warmup backward plan。
+
+            clear_existing_cache:
+                是否清空 cuda_ops 内部 warmup cache。
+
+            warmup_all_chunks:
+                是否 warmup 所有 chunk。
+                默认 False，只 warmup 代表性 chunk。
+
+        返回:
+            List[dict]。
+        """
+
+        if seq_len is None:
+            seq_len = int(
+                self.config.block_size
+            )
+
+        if chunk_size is None:
+            chunk_size = int(
+                self.config.chunk_size
+            )
+
+        if repeat is None:
+            repeat = int(
+                getattr(
+                    self.config,
+                    "cuda_warmup_repeat",
+                    3
+                )
+            )
+
+        if device is None:
+            try:
+                device = next(
+                    self.parameters()
+                ).device
+            except StopIteration:
+                device = torch.device(
+                    "cuda"
+                )
+
+        device = torch.device(
+            device
+        )
+
+        if device.type != "cuda":
+            raise RuntimeError(
+                "warmup_cuda_dynamic_conv 需要 CUDA device。"
+            )
+
+        if dtype is None:
+            try:
+                dtype = next(
+                    self.parameters()
+                ).dtype
+            except StopIteration:
+                dtype = torch.float16
+
+        return self.backbone.warmup_cuda_dynamic_conv(
+            batch_size=batch_size,
+            seq_len=seq_len,
+            chunk_size=chunk_size,
+            device=device,
+            dtype=dtype,
+            repeat=repeat,
+            include_backward=include_backward,
+            clear_existing_cache=clear_existing_cache,
+            warmup_all_chunks=warmup_all_chunks
+        )
+
     def _estimate_loss_chunk_checkpoint_mb(
         self,
         B: int,
@@ -4535,33 +5255,6 @@ class DilatedUnsharedDynamicConvLM(nn.Module):
     ) -> float:
         """
         估算整个 loss loop 如果不 checkpoint 会长期保存的激活。
-
-        每个 loss chunk 主要有：
-
-        1. logits_chunk:
-            [B,T,V]
-            dtype 通常为 bf16/fp16/fp32。
-
-        2. cross_entropy 内部 log_softmax / softmax buffer:
-            PyTorch cross_entropy 通常会产生 fp32 级别中间。
-            当前日志已经证明：
-                [8192,8097] * 4 bytes ≈ 254 MiB
-
-        因此保守估算：
-            logits:
-                B * T * V * dtype_bytes
-
-            CE fp32 buffer:
-                B * T * V * 4
-
-            反传额外:
-                再按 1 份 dtype logits 估算。
-
-        单 chunk:
-            B * T * V * (4 + 2 * dtype_bytes)
-
-        整个 loss loop:
-            单 chunk * num_loss_chunks
         """
 
         V = int(
@@ -4616,31 +5309,6 @@ class DilatedUnsharedDynamicConvLM(nn.Module):
         loss_chunk_size: int,
         dtype: torch.dtype
     ) -> bool:
-        """
-        loss chunk checkpoint 自适应决策。
-
-        关键：
-            必须按整个 loss loop 的累计显存判断，
-            不能只看单个 loss chunk。
-
-        对你的配置：
-            B=1
-            L=262144
-            loss_chunk_size=8192
-            V=8097
-            dtype=bf16
-
-            单 chunk:
-                CE fp32 buffer ≈ 253 MiB
-                bf16 logits 等 ≈ 253 MiB 左右
-                合计估算 ≈ 506 MiB
-
-            32 chunks:
-                约 16 GiB 级别估算
-
-            必须 checkpoint。
-        """
-
         estimated_mb = self._estimate_loss_chunk_checkpoint_mb(
             B=B,
             L=L,
@@ -4670,10 +5338,6 @@ class DilatedUnsharedDynamicConvLM(nn.Module):
 
         输出:
             loss_chunk: scalar, reduction=sum
-
-        被 checkpoint 后：
-            logits_chunk 和 cross_entropy 内部 fp32 log_softmax
-            不会在 forward 后长期保存，而是在 backward 时重算。
         """
 
         if h_chunk.dim() != 3:
@@ -4857,6 +5521,7 @@ class DilatedUnsharedDynamicConvLM(nn.Module):
         )
 
         return logits, None
+
 
 # ============================================================
 # 15. 兼容别名

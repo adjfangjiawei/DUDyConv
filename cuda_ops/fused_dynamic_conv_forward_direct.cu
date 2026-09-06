@@ -34,7 +34,24 @@ enum class FDCForwardPlan : int {
     //
     // 不替换旧 N128K3D256。
     // 只是作为独立候选 plan 参与 warmup / cache / dispatch。
-    N128K3D256BatchedSgemm = 11
+    N128K3D256BatchedSgemm = 11,
+
+    // 新增 fp16 forward GEMM 方案。
+    //
+    // 这些方案只支持:
+    //   B == 1
+    //   D == 256
+    //   K == 3
+    //   dilation == 1
+    //   dtype == torch.float16
+    //   N == 16 / 32 / 64 / 128
+    //
+    // 使用独立 plan id，避免和 fp32 plan 混淆。
+    // 只要 warmup candidate 包含它们，最终仍然是谁快选谁。
+    N16K3D256GemmFp16 = 1016,
+    N32K3D256GemmFp16 = 1032,
+    N64K3D256GemmFp16 = 1064,
+    N128K3D256GemmFp16 = 1128
 };
 
 static inline const char* fdc_forward_plan_name_impl(FDCForwardPlan p) {
@@ -68,6 +85,18 @@ static inline const char* fdc_forward_plan_name_impl(FDCForwardPlan p) {
 
         case FDCForwardPlan::N128K3D256BatchedSgemm:
             return "forward_n128_k3_d256_batched_sgemm";
+
+        case FDCForwardPlan::N16K3D256GemmFp16:
+            return "forward_n16_k3_d256_gemm_fp16";
+
+        case FDCForwardPlan::N32K3D256GemmFp16:
+            return "forward_n32_k3_d256_gemm_fp16";
+
+        case FDCForwardPlan::N64K3D256GemmFp16:
+            return "forward_n64_k3_d256_gemm_fp16";
+
+        case FDCForwardPlan::N128K3D256GemmFp16:
+            return "forward_n128_k3_d256_gemm_fp16";
 
         default:
             return "unknown";
@@ -247,6 +276,11 @@ struct FDCForwardShapeInfo {
     bool n128k3d256_batched_sgemm;
     bool n6k3d512;
     bool smalln_preload;
+
+    bool n16k3d256_gemm_fp16;
+    bool n32k3d256_gemm_fp16;
+    bool n64k3d256_gemm_fp16;
+    bool n128k3d256_gemm_fp16;
 };
 
 static inline FDCForwardShapeInfo make_fdc_forward_shape_info(
@@ -337,6 +371,46 @@ static inline FDCForwardShapeInfo make_fdc_forward_shape_info(
     s.smalln_preload =
         s.N <= 16 &&
         s.K <= 16;
+
+    // fp16 Tensor Core GEMM forward plans。
+    //
+    // 这里是粗略 shape 标记，最终仍由对应 available_cuda 做完整检查。
+    // T 阈值先设置为 >=1024，避免很小 T 下 cuBLAS launch 和临时 W 不划算。
+    s.n16k3d256_gemm_fp16 =
+        s.B == 1 &&
+        s.D == 256 &&
+        s.N == 16 &&
+        s.K == 3 &&
+        s.dil1 &&
+        s.is_fp16 &&
+        s.T >= 1024;
+
+    s.n32k3d256_gemm_fp16 =
+        s.B == 1 &&
+        s.D == 256 &&
+        s.N == 32 &&
+        s.K == 3 &&
+        s.dil1 &&
+        s.is_fp16 &&
+        s.T >= 1024;
+
+    s.n64k3d256_gemm_fp16 =
+        s.B == 1 &&
+        s.D == 256 &&
+        s.N == 64 &&
+        s.K == 3 &&
+        s.dil1 &&
+        s.is_fp16 &&
+        s.T >= 1024;
+
+    s.n128k3d256_gemm_fp16 =
+        s.B == 1 &&
+        s.D == 256 &&
+        s.N == 128 &&
+        s.K == 3 &&
+        s.dil1 &&
+        s.is_fp16 &&
+        s.T >= 1024;
 
     (void)mix;
 
@@ -472,6 +546,46 @@ static inline bool fdc_forward_plan_available(
                 dilation
             );
 
+        case FDCForwardPlan::N16K3D256GemmFp16:
+            return s.n16k3d256_gemm_fp16 &&
+                   fdc_forward_n16_k3_d256_gemm_fp16_available_cuda(
+                       h,
+                       kc,
+                       mix,
+                       off,
+                       dilation
+                   );
+
+        case FDCForwardPlan::N32K3D256GemmFp16:
+            return s.n32k3d256_gemm_fp16 &&
+                   fdc_forward_n32_k3_d256_gemm_fp16_available_cuda(
+                       h,
+                       kc,
+                       mix,
+                       off,
+                       dilation
+                   );
+
+        case FDCForwardPlan::N64K3D256GemmFp16:
+            return s.n64k3d256_gemm_fp16 &&
+                   fdc_forward_n64_k3_d256_gemm_fp16_available_cuda(
+                       h,
+                       kc,
+                       mix,
+                       off,
+                       dilation
+                   );
+
+        case FDCForwardPlan::N128K3D256GemmFp16:
+            return s.n128k3d256_gemm_fp16 &&
+                   fdc_forward_n128_k3_d256_gemm_fp16_available_cuda(
+                       h,
+                       kc,
+                       mix,
+                       off,
+                       dilation
+                   );
+
         default:
             return false;
     }
@@ -572,6 +686,38 @@ static torch::Tensor fdc_run_forward_plan(
                 off
             );
 
+        case FDCForwardPlan::N16K3D256GemmFp16:
+            return fdc_forward_n16_k3_d256_gemm_fp16_cuda(
+                h,
+                kc,
+                mix,
+                off
+            );
+
+        case FDCForwardPlan::N32K3D256GemmFp16:
+            return fdc_forward_n32_k3_d256_gemm_fp16_cuda(
+                h,
+                kc,
+                mix,
+                off
+            );
+
+        case FDCForwardPlan::N64K3D256GemmFp16:
+            return fdc_forward_n64_k3_d256_gemm_fp16_cuda(
+                h,
+                kc,
+                mix,
+                off
+            );
+
+        case FDCForwardPlan::N128K3D256GemmFp16:
+            return fdc_forward_n128_k3_d256_gemm_fp16_cuda(
+                h,
+                kc,
+                mix,
+                off
+            );
+
         default:
             TORCH_CHECK(false, "unknown fused dynamic conv forward plan");
     }
@@ -595,6 +741,13 @@ static FDCForwardPlan fdc_default_forward_plan(
         off,
         dilation
     );
+
+    // fp16 新 GEMM plan 不放进 default heuristic。
+    //
+    // 原因：
+    //   1. 不改变没有 warmup 时的原始行为。
+    //   2. fp16 新方案只通过 candidate warmup 实测进入 cache。
+    //   3. warmup 后仍然是谁快选谁。
 
     if (s.n16k3d256 && fdc_forward_n16_k3_d256_available_cuda(
             h,
@@ -695,6 +848,17 @@ static std::vector<FDCForwardPlan> fdc_all_candidate_forward_plans(
     std::vector<FDCForwardPlan> plans;
 
     FDCForwardPlan all[] = {
+        // 新增 fp16 Tensor Core GEMM forward plans。
+        //
+        // 这些 plan 只在 dtype=float16 且 N=16/32/64/128,D=256,K=3,dilation=1 时 available。
+        // 放在前面只影响 warmup 测试顺序。
+        // 最终仍由 median_ms 谁快选谁。
+        FDCForwardPlan::N16K3D256GemmFp16,
+        FDCForwardPlan::N32K3D256GemmFp16,
+        FDCForwardPlan::N64K3D256GemmFp16,
+        FDCForwardPlan::N128K3D256GemmFp16,
+
+        // 原有 fp32 / direct / generic candidates。
         FDCForwardPlan::N16K3D256,
         FDCForwardPlan::N32K3D256,
         FDCForwardPlan::N64K3D256,

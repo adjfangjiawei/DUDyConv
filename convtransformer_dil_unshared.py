@@ -1113,18 +1113,13 @@ def _upgrade_config_dict(
     """
     兼容旧 checkpoint/config，并补齐新版 ModelConfig 字段。
 
-    旧字段：
-        num_dynamic_layers
-        source_num_blocks
-
-    新结构：
-        1. dilation 层数由 block_size 自动计算；
-        2. source_channels 替代旧 source_num_blocks/num_dynamic_layers 的 source 宽度概念；
-        3. kernel generator 已改为:
-             D-mix -> LayerNorm -> depthwise causal conv -> residual
-           但这不需要额外 config 字段；
-        4. StreamingKernelGenConv1d 已删除 source_channels 参数，
-           但 ModelConfig.source_channels 仍然用于 source conv 分支。
+    兼容点：
+        1. 旧 checkpoint 可能没有 adaptive_checkpoint。
+        2. 旧 checkpoint 可能没有 checkpoint_activation_threshold_mb。
+        3. 旧 checkpoint 可能没有 use_preallocated_chunk_output。
+        4. 旧 checkpoint 可能没有 cuda_warmup_repeat。
+        5. 旧 checkpoint 可能使用 stream_k/materialized_windows。
+        6. 新版默认 dynamic_conv_impl 建议为 cuda_fused。
     """
 
     if args_dict is None:
@@ -1264,6 +1259,26 @@ def _upgrade_config_dict(
         )
     )
 
+    adaptive_checkpoint = bool(
+        config_dict.get(
+            "adaptive_checkpoint",
+            args_dict.get(
+                "adaptive_checkpoint",
+                True
+            )
+        )
+    )
+
+    checkpoint_activation_threshold_mb = float(
+        config_dict.get(
+            "checkpoint_activation_threshold_mb",
+            args_dict.get(
+                "checkpoint_activation_threshold_mb",
+                512.0
+            )
+        )
+    )
+
     chunk_size = int(
         config_dict.get(
             "chunk_size",
@@ -1344,7 +1359,7 @@ def _upgrade_config_dict(
             "dynamic_conv_impl",
             args_dict.get(
                 "dynamic_conv_impl",
-                "stream_k"
+                "cuda_fused"
             )
         )
     )
@@ -1355,6 +1370,16 @@ def _upgrade_config_dict(
             args_dict.get(
                 "dynamic_conv_tmp_mb_limit",
                 64.0
+            )
+        )
+    )
+
+    cuda_warmup_repeat = int(
+        config_dict.get(
+            "cuda_warmup_repeat",
+            args_dict.get(
+                "cuda_warmup_repeat",
+                3
             )
         )
     )
@@ -1405,6 +1430,16 @@ def _upgrade_config_dict(
         )
     )
 
+    use_preallocated_chunk_output = bool(
+        config_dict.get(
+            "use_preallocated_chunk_output",
+            args_dict.get(
+                "use_preallocated_chunk_output",
+                True
+            )
+        )
+    )
+
     upgraded = {
         "vocab_size": vocab_size,
         "block_size": block_size,
@@ -1419,6 +1454,8 @@ def _upgrade_config_dict(
         "use_bias": use_bias,
         "use_sinusoidal_pos": use_sinusoidal_pos,
         "use_checkpoint": use_checkpoint,
+        "adaptive_checkpoint": adaptive_checkpoint,
+        "checkpoint_activation_threshold_mb": checkpoint_activation_threshold_mb,
         "chunk_size": chunk_size,
         "loss_chunk_size": loss_chunk_size,
         "normalize_kernel": normalize_kernel,
@@ -1427,13 +1464,16 @@ def _upgrade_config_dict(
         "source_fused_mixed": source_fused_mixed,
         "dynamic_conv_impl": dynamic_conv_impl,
         "dynamic_conv_tmp_mb_limit": dynamic_conv_tmp_mb_limit,
+        "cuda_warmup_repeat": cuda_warmup_repeat,
         "use_nonlinear_residual": use_nonlinear_residual,
         "use_source_nonlinear_residual": use_source_nonlinear_residual,
         "nonlinear_residual_initial_scale": nonlinear_residual_initial_scale,
-        "nonlinear_residual_bias": nonlinear_residual_bias
+        "nonlinear_residual_bias": nonlinear_residual_bias,
+        "use_preallocated_chunk_output": use_preallocated_chunk_output
     }
 
     return upgraded
+
 
 def load_checkpoint(
     checkpoint_path: str,
@@ -1806,14 +1846,18 @@ def debug_print_model_structure(
     print(f"normalize_kernel: {config.normalize_kernel}")
     print(f"initial_scale: {config.initial_scale}")
     print(f"use_checkpoint: {config.use_checkpoint}")
+    print(f"adaptive_checkpoint: {getattr(config, 'adaptive_checkpoint', True)}")
+    print(f"checkpoint_activation_threshold_mb: {getattr(config, 'checkpoint_activation_threshold_mb', 512.0)}")
     print(f"source_conv_impl: {config.source_conv_impl}")
     print(f"source_fused_mixed: {config.source_fused_mixed}")
     print(f"dynamic_conv_impl: {config.dynamic_conv_impl}")
     print(f"dynamic_conv_tmp_mb_limit: {config.dynamic_conv_tmp_mb_limit}")
+    print(f"cuda_warmup_repeat: {getattr(config, 'cuda_warmup_repeat', 3)}")
     print(f"use_nonlinear_residual: {config.use_nonlinear_residual}")
     print(f"use_source_nonlinear_residual: {config.use_source_nonlinear_residual}")
     print(f"nonlinear_residual_initial_scale: {config.nonlinear_residual_initial_scale}")
     print(f"nonlinear_residual_bias: {config.nonlinear_residual_bias}")
+    print(f"use_preallocated_chunk_output: {getattr(config, 'use_preallocated_chunk_output', True)}")
     print(f"computed dilated layers: {num_layers}")
     print("dilations:", [2 ** (i + 1) for i in range(num_layers)])
     print("-" * 80)
@@ -1823,16 +1867,18 @@ def debug_print_model_structure(
     print("  LayerNorm:    over N*K")
     print("  Conv:         depthwise causal Conv1d, groups=N*K")
     print("  Residual:     logits = identity + conv(LN(identity_local_segment))")
-    print("  output:       [B,T,N,K]")
+    print("  reshape:      [B,N*K,T] -> [B,N,K,T]")
     print("  softmax dim:  K")
+    print("  flip K:       使 kk=0 表示当前位置")
+    print("  output:       [B,K,N,T]")
     print("-" * 80)
     print("Dynamic conv 结构:")
     print("  h_full:       [B,D,L]")
-    print("  kernel_chunk: [B,T,N,K]")
+    print("  kernel_chunk: [B,K,N,T]")
     print("  kernel_mix:   [D,N]")
-    print("  mixed_kernel: [B,D,T,K]")
     print("  output:       [B,D,T]")
     print("=" * 80)
+
 
 # ============================================================
 # 13. Debug: shape 检查
@@ -2057,6 +2103,178 @@ def debug_check_model_causality(
 
     model.train()
 
+@torch.no_grad()
+def warmup_model_cuda_dynamic_conv_if_needed(
+    model: nn.Module,
+    config: ModelConfig,
+    args,
+    device: torch.device,
+    precision: str,
+    batch_size: int
+) -> Optional[List[dict]]:
+    """
+    创建模型或加载模型权重后，对模型内部 CUDA fused dynamic conv 做 warmup。
+
+    调用条件：
+        1. device 是 cuda；
+        2. args.no_cuda_warmup 为 False；
+        3. config.dynamic_conv_impl 是 "cuda_fused" 或 "auto"。
+
+    注意：
+        - 只 warmup 动态卷积 CUDA 算子 plan；
+        - 不执行完整模型 forward；
+        - 不读数据；
+        - 不影响训练随机状态中的模型参数；
+        - warmup 使用空 tensor，只为 cuda_ops 选择/缓存 plan。
+    """
+
+    if device.type != "cuda":
+        print("=" * 80)
+        print("CUDA warmup 跳过：当前 device 不是 cuda")
+        print("=" * 80)
+        return None
+
+    if bool(
+        getattr(
+            args,
+            "no_cuda_warmup",
+            False
+        )
+    ):
+        print("=" * 80)
+        print("CUDA warmup 跳过：命令行指定 --no_cuda_warmup")
+        print("=" * 80)
+        return None
+
+    if str(config.dynamic_conv_impl) not in (
+        "cuda_fused",
+        "auto"
+    ):
+        print("=" * 80)
+        print(
+            "CUDA warmup 跳过：dynamic_conv_impl 不是 cuda_fused/auto，"
+            f"当前为 {config.dynamic_conv_impl}"
+        )
+        print("=" * 80)
+        return None
+
+    # 暂时硬编码fp32，应当根据网络实际进入这一层的类型进行warmup，绝对不对根据外面设的精度来
+    warmup_dtype = torch.float32
+
+    if warmup_dtype == torch.bfloat16 and not torch.cuda.is_bf16_supported():
+        raise RuntimeError(
+            "请求 bf16 warmup，但当前 GPU 不支持 bf16。"
+        )
+
+    repeat = int(
+        getattr(
+            args,
+            "cuda_warmup_repeat",
+            getattr(
+                config,
+                "cuda_warmup_repeat",
+                3
+            )
+        )
+    )
+
+    warmup_all_chunks = bool(
+        getattr(
+            args,
+            "cuda_warmup_all_chunks",
+            False
+        )
+    )
+
+    include_backward = not bool(
+        getattr(
+            args,
+            "cuda_warmup_forward_only",
+            False
+        )
+    )
+
+    print("=" * 80)
+    print("开始 CUDA fused dynamic conv warmup")
+    print(f"dynamic_conv_impl: {config.dynamic_conv_impl}")
+    print(f"batch_size: {batch_size}")
+    print(f"seq_len: {config.block_size}")
+    print(f"chunk_size: {config.chunk_size}")
+    print(f"embed_dim D: {config.embed_dim}")
+    print(f"num_kernels N: {config.num_kernels}")
+    print(f"dynamic_kernel_size K: {config.dynamic_kernel_size}")
+    print(f"dtype: {warmup_dtype}")
+    print(f"repeat: {repeat}")
+    print(f"include_backward: {include_backward}")
+    print(f"warmup_all_chunks: {warmup_all_chunks}")
+    print("=" * 80)
+
+    t0 = time.time()
+
+    warmup_info = model.warmup_cuda_dynamic_conv(
+        batch_size=batch_size,
+        seq_len=config.block_size,
+        chunk_size=config.chunk_size,
+        device=device,
+        dtype=warmup_dtype,
+        repeat=repeat,
+        include_backward=include_backward,
+        clear_existing_cache=True,
+        warmup_all_chunks=warmup_all_chunks
+    )
+
+    elapsed = time.time() - t0
+
+    print("=" * 80)
+    print("CUDA fused dynamic conv warmup 完成")
+    print(f"耗时: {elapsed:.2f}s")
+    print(f"warmup entries: {len(warmup_info)}")
+    print("-" * 80)
+
+    max_print = int(
+        getattr(
+            args,
+            "cuda_warmup_print_limit",
+            32
+        )
+    )
+
+    for i, item in enumerate(warmup_info[:max_print]):
+        layer_index = item.get(
+            "layer_index",
+            None
+        )
+
+        prefix = (
+            f"layer={layer_index} "
+            if layer_index is not None
+            else ""
+        )
+
+        msg = (
+            f"{prefix}"
+            f"start={item.get('start')} "
+            f"end={item.get('end')} "
+            f"T={item.get('T')} "
+            f"fwd={item.get('forward_plan_id')}:{item.get('forward_plan_name')}"
+        )
+
+        if "backward_plan_id" in item:
+            msg += (
+                f" "
+                f"bwd={item.get('backward_plan_id')}:{item.get('backward_plan_name')}"
+            )
+
+        print(msg)
+
+    if len(warmup_info) > max_print:
+        print(
+            f"... 还有 {len(warmup_info) - max_print} 条 warmup 信息未打印"
+        )
+
+    print("=" * 80)
+
+    return warmup_info
 
 # ============================================================
 # 15. 参数量随 block_size 检查
@@ -2113,6 +2331,8 @@ def build_model_config_from_args(
         use_bias=True,
         use_sinusoidal_pos=True,
         use_checkpoint=not args.no_checkpoint,
+        adaptive_checkpoint=args.adaptive_checkpoint,
+        checkpoint_activation_threshold_mb=args.checkpoint_activation_threshold_mb,
         chunk_size=args.chunk_size,
         loss_chunk_size=args.loss_chunk_size,
         normalize_kernel=not args.no_kernel_norm,
@@ -2121,16 +2341,18 @@ def build_model_config_from_args(
         source_fused_mixed=not args.no_source_fused_mixed,
         dynamic_conv_impl=args.dynamic_conv_impl,
         dynamic_conv_tmp_mb_limit=args.dynamic_conv_tmp_mb_limit,
+        cuda_warmup_repeat=args.cuda_warmup_repeat,
         use_nonlinear_residual=not args.no_nonlinear_residual,
         use_source_nonlinear_residual=args.use_source_nonlinear_residual,
         nonlinear_residual_initial_scale=args.nonlinear_residual_initial_scale,
-        nonlinear_residual_bias=not args.no_nonlinear_residual_bias
+        nonlinear_residual_bias=not args.no_nonlinear_residual_bias,
+        use_preallocated_chunk_output=not args.no_preallocated_chunk_output
     )
+
 
 # ============================================================
 # 17. 训练
 # ============================================================
-
 def train(args):
     set_seed(args.seed)
 
@@ -2168,6 +2390,10 @@ def train(args):
     print(f"Source fused mixed: {not args.no_source_fused_mixed}")
     print(f"Dynamic conv impl: {args.dynamic_conv_impl}")
     print(f"Dynamic conv tmp MB limit: {args.dynamic_conv_tmp_mb_limit}")
+    print(f"CUDA warmup disabled: {args.no_cuda_warmup}")
+    print(f"CUDA warmup repeat: {args.cuda_warmup_repeat}")
+    print(f"CUDA warmup all chunks: {args.cuda_warmup_all_chunks}")
+    print(f"CUDA warmup forward only: {args.cuda_warmup_forward_only}")
     print(f"Use nonlinear residual: {not args.no_nonlinear_residual}")
     print(f"Use source nonlinear residual: {args.use_source_nonlinear_residual}")
     print(f"Nonlinear residual initial scale: {args.nonlinear_residual_initial_scale}")
@@ -2176,11 +2402,13 @@ def train(args):
     print(f"Loss chunk size: {args.loss_chunk_size}")
     print(f"Kernel normalization: {not args.no_kernel_norm}")
     print(f"Activation checkpointing: {not args.no_checkpoint}")
+    print(f"Adaptive checkpointing: {args.adaptive_checkpoint}")
+    print(f"Checkpoint threshold MB: {args.checkpoint_activation_threshold_mb}")
+    print(f"Use preallocated chunk output: {not args.no_preallocated_chunk_output}")
     print(f"Text chunk size: {args.text_chunk_size:,}")
     print(f"Rebuild memmap: {args.rebuild_memmap}")
     print(f"Precision: {args.precision}")
     print("=" * 80)
-
 
     resume_ckpt = None
 
@@ -2210,6 +2438,8 @@ def train(args):
         print("=" * 80)
 
         config.use_checkpoint = not args.no_checkpoint
+        config.adaptive_checkpoint = args.adaptive_checkpoint
+        config.checkpoint_activation_threshold_mb = args.checkpoint_activation_threshold_mb
         config.normalize_kernel = not args.no_kernel_norm
         config.initial_scale = args.initial_scale
         config.chunk_size = args.chunk_size
@@ -2218,17 +2448,18 @@ def train(args):
         config.source_fused_mixed = not args.no_source_fused_mixed
         config.dynamic_conv_impl = args.dynamic_conv_impl
         config.dynamic_conv_tmp_mb_limit = args.dynamic_conv_tmp_mb_limit
+        config.cuda_warmup_repeat = args.cuda_warmup_repeat
         config.use_nonlinear_residual = not args.no_nonlinear_residual
         config.use_source_nonlinear_residual = args.use_source_nonlinear_residual
         config.nonlinear_residual_initial_scale = args.nonlinear_residual_initial_scale
         config.nonlinear_residual_bias = not args.no_nonlinear_residual_bias
-
+        config.use_preallocated_chunk_output = not args.no_preallocated_chunk_output
 
         total_chars = None
 
         print("=" * 80)
         print("使用 checkpoint 中的模型结构配置")
-        print("应用当前命令行的 checkpoint/kernel_norm/initial_scale/chunk 参数")
+        print("应用当前命令行的 checkpoint/kernel_norm/initial_scale/chunk/cuda 参数")
         print("跳过当前文本对 checkpoint 词表的兼容性检查")
         print("不使用文件字节数作为字符数")
         print("=" * 80)
@@ -2329,6 +2560,15 @@ def train(args):
         print("=" * 80)
         print("模型权重已从 checkpoint 恢复")
         print("=" * 80)
+
+    warmup_model_cuda_dynamic_conv_if_needed(
+        model=model,
+        config=config,
+        args=args,
+        device=device,
+        precision=args.precision,
+        batch_size=args.batch_size
+    )
 
     total_params, trainable_params = count_parameters(model)
 
@@ -2500,6 +2740,8 @@ def train(args):
         train_loader.start()
 
     train_start_time = time.time()
+    last_log_time = train_start_time
+    last_log_step = int(global_step)
 
     print("=" * 80)
     print("开始训练")
@@ -2610,13 +2852,39 @@ def train(args):
                 running_loss += loss_value
 
                 if global_step % args.log_interval == 0:
+                    if device.type == "cuda":
+                        torch.cuda.synchronize(
+                            device=device
+                        )
+
+                    now_time = time.time()
+
+                    log_elapsed = now_time - last_log_time
+
+                    steps_since_last_log = max(
+                        1,
+                        int(global_step) - int(last_log_step)
+                    )
+
+                    sec_per_step = log_elapsed / float(
+                        steps_since_last_log
+                    )
+
+                    total_elapsed = now_time - train_start_time
+
                     print(
                         f"Epoch [{epoch}/{args.epochs}] "
                         f"Step [{step}/{args.steps_per_epoch}] "
                         f"Global [{global_step}] "
                         f"Loss: {loss_value:.6f} "
-                        f"EpochAvg: {running_loss / step:.6f}"
+                        f"EpochAvg: {running_loss / step:.6f} "
+                        f"LogElapsed: {log_elapsed:.2f}s "
+                        f"Sec/Step: {sec_per_step:.4f}s "
+                        f"TotalElapsed: {total_elapsed:.2f}s"
                     )
+
+                    last_log_time = now_time
+                    last_log_step = int(global_step)
 
                 if global_step % args.eval_interval == 0:
                     losses = estimate_loss(
@@ -2696,6 +2964,14 @@ def train(args):
 
                     model.train()
 
+                    if device.type == "cuda":
+                        torch.cuda.synchronize(
+                            device=device
+                        )
+
+                    last_log_time = time.time()
+                    last_log_step = int(global_step)
+
                 del x
                 del y
                 del loss
@@ -2720,6 +2996,14 @@ def train(args):
                 config=config,
                 args_dict=vars(args)
             )
+
+            if device.type == "cuda":
+                torch.cuda.synchronize(
+                    device=device
+                )
+
+            last_log_time = time.time()
+            last_log_step = int(global_step)
 
     finally:
         train_loader.stop()
@@ -2771,13 +3055,28 @@ def generate_only(args):
         device=device
     )
 
+    config.dynamic_conv_impl = args.dynamic_conv_impl
+    config.chunk_size = args.chunk_size
+    config.cuda_warmup_repeat = args.cuda_warmup_repeat
+
     print("=" * 80)
     print("加载 checkpoint 完成")
     print(f"Checkpoint: {args.checkpoint_path}")
     print(f"Epoch: {ckpt.get('epoch')}")
     print(f"Global step: {ckpt.get('global_step')}")
     print(f"Best val loss: {ckpt.get('best_val_loss')}")
+    print(f"Dynamic conv impl: {config.dynamic_conv_impl}")
+    print(f"Chunk size: {config.chunk_size}")
     print("=" * 80)
+
+    warmup_model_cuda_dynamic_conv_if_needed(
+        model=model,
+        config=config,
+        args=args,
+        device=device,
+        precision=args.precision,
+        batch_size=1
+    )
 
     sample = generate(
         model=model,
@@ -2792,7 +3091,6 @@ def generate_only(args):
     )
 
     print(sample)
-
 
 # ============================================================
 # 19. argparse
@@ -2831,6 +3129,27 @@ def build_arg_parser():
         "--no_checkpoint",
         action="store_true",
         help="关闭 activation checkpointing。默认开启。"
+    )
+
+    parser.add_argument(
+        "--adaptive_checkpoint",
+        action="store_true",
+        default=True,
+        help="启用自适应 checkpoint。默认开启。"
+    )
+
+    parser.add_argument(
+        "--no_adaptive_checkpoint",
+        dest="adaptive_checkpoint",
+        action="store_false",
+        help="关闭自适应 checkpoint。"
+    )
+
+    parser.add_argument(
+        "--checkpoint_activation_threshold_mb",
+        type=float,
+        default=512.0,
+        help="自适应 checkpoint 激活阈值，单位 MB。"
     )
 
     parser.add_argument(
@@ -3009,7 +3328,8 @@ def build_arg_parser():
         default="einsum",
         choices=[
             "einsum",
-            "auto"
+            "auto",
+            "grouped_conv1d"
         ],
         help="source 膨胀卷积实现方式。"
     )
@@ -3023,13 +3343,15 @@ def build_arg_parser():
     parser.add_argument(
         "--dynamic_conv_impl",
         type=str,
-        default="stream_k",
+        default="cuda_fused",
         choices=[
+            "cuda_fused",
             "stream_k",
+            "materialized_kernel_stream_x",
             "materialized_windows",
             "auto"
         ],
-        help="动态卷积实现方式。"
+        help="动态卷积实现方式。默认 cuda_fused。"
     )
 
     parser.add_argument(
@@ -3037,6 +3359,38 @@ def build_arg_parser():
         type=float,
         default=64.0,
         help="保留字段，用于未来 fallback 或调试。"
+    )
+
+    parser.add_argument(
+        "--cuda_warmup_repeat",
+        type=int,
+        default=3,
+        help="cuda_ops dynamic conv warmup repeat。"
+    )
+
+    parser.add_argument(
+        "--no_cuda_warmup",
+        action="store_true",
+        help="关闭创建/加载模型后的 CUDA dynamic conv warmup。"
+    )
+
+    parser.add_argument(
+        "--cuda_warmup_all_chunks",
+        action="store_true",
+        help="warmup 所有实际 chunk。默认只 warmup 代表性 chunk。"
+    )
+
+    parser.add_argument(
+        "--cuda_warmup_forward_only",
+        action="store_true",
+        help="只 warmup forward，不 warmup backward。"
+    )
+
+    parser.add_argument(
+        "--cuda_warmup_print_limit",
+        type=int,
+        default=32,
+        help="最多打印多少条 warmup plan 信息。"
     )
 
     parser.add_argument(
@@ -3062,6 +3416,12 @@ def build_arg_parser():
         "--no_nonlinear_residual_bias",
         action="store_true",
         help="关闭非线性残差线性层 bias。默认使用 bias。"
+    )
+
+    parser.add_argument(
+        "--no_preallocated_chunk_output",
+        action="store_true",
+        help="关闭预分配 chunk 输出，改用 list + torch.cat。"
     )
 
     parser.add_argument(
@@ -3159,6 +3519,7 @@ def build_arg_parser():
 
     return parser
 
+
 # ============================================================
 # 20. main
 # ============================================================
@@ -3199,24 +3560,38 @@ def main():
 
     if args.source_conv_impl not in (
         "einsum",
-        "auto"
+        "auto",
+        "grouped_conv1d"
     ):
         raise ValueError(
-            f"source_conv_impl 必须为 'einsum' 或 'auto'，但得到 {args.source_conv_impl}"
+            f"source_conv_impl 必须为 'einsum'、'auto' 或 'grouped_conv1d'，"
+            f"但得到 {args.source_conv_impl}"
         )
 
     if args.dynamic_conv_impl not in (
+        "cuda_fused",
         "stream_k",
+        "materialized_kernel_stream_x",
         "materialized_windows",
         "auto"
     ):
         raise ValueError(
-            f"dynamic_conv_impl 必须为 'stream_k'、'materialized_windows' 或 'auto'，"
+            f"dynamic_conv_impl 必须为 'cuda_fused'、'stream_k'、"
+            f"'materialized_kernel_stream_x'、'materialized_windows' 或 'auto'，"
             f"但得到 {args.dynamic_conv_impl}"
         )
 
     if args.dynamic_conv_tmp_mb_limit <= 0:
         raise ValueError("dynamic_conv_tmp_mb_limit 必须为正数。")
+
+    if args.cuda_warmup_repeat <= 0:
+        raise ValueError("cuda_warmup_repeat 必须为正数。")
+
+    if args.cuda_warmup_print_limit <= 0:
+        raise ValueError("cuda_warmup_print_limit 必须为正数。")
+
+    if args.checkpoint_activation_threshold_mb <= 0:
+        raise ValueError("checkpoint_activation_threshold_mb 必须为正数。")
 
     if args.nonlinear_residual_initial_scale < 0:
         raise ValueError("nonlinear_residual_initial_scale 不能为负数。")
@@ -3231,6 +3606,7 @@ def main():
         generate_only(args)
     else:
         train(args)
+
 
 if __name__ == "__main__":
     main()

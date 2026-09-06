@@ -120,6 +120,69 @@ torch::Tensor fdc_forward_n128_k3_d256_cuda(torch::Tensor h, torch::Tensor kc,
                                             torch::Tensor mix, int64_t off);
 
 // ======================================================================================
+// Forward N=128 K=3 D=256 batched SGEMM plan
+// ======================================================================================
+
+bool fdc_forward_n128_k3_d256_batched_sgemm_available_cuda(torch::Tensor h,
+                                                           torch::Tensor kc,
+                                                           torch::Tensor mix,
+                                                           int64_t off,
+                                                           int64_t dilation);
+
+torch::Tensor fdc_forward_n128_k3_d256_batched_sgemm_cuda(torch::Tensor h,
+                                                          torch::Tensor kc,
+                                                          torch::Tensor mix,
+                                                          int64_t off);
+
+// ======================================================================================
+// Forward fp16 Tensor Core GEMM plans
+// ======================================================================================
+
+bool fdc_forward_n16_k3_d256_gemm_fp16_available_cuda(torch::Tensor h,
+                                                      torch::Tensor kc,
+                                                      torch::Tensor mix,
+                                                      int64_t off,
+                                                      int64_t dilation);
+
+torch::Tensor fdc_forward_n16_k3_d256_gemm_fp16_cuda(torch::Tensor h,
+                                                     torch::Tensor kc,
+                                                     torch::Tensor mix,
+                                                     int64_t off);
+
+bool fdc_forward_n32_k3_d256_gemm_fp16_available_cuda(torch::Tensor h,
+                                                      torch::Tensor kc,
+                                                      torch::Tensor mix,
+                                                      int64_t off,
+                                                      int64_t dilation);
+
+torch::Tensor fdc_forward_n32_k3_d256_gemm_fp16_cuda(torch::Tensor h,
+                                                     torch::Tensor kc,
+                                                     torch::Tensor mix,
+                                                     int64_t off);
+
+bool fdc_forward_n64_k3_d256_gemm_fp16_available_cuda(torch::Tensor h,
+                                                      torch::Tensor kc,
+                                                      torch::Tensor mix,
+                                                      int64_t off,
+                                                      int64_t dilation);
+
+torch::Tensor fdc_forward_n64_k3_d256_gemm_fp16_cuda(torch::Tensor h,
+                                                     torch::Tensor kc,
+                                                     torch::Tensor mix,
+                                                     int64_t off);
+
+bool fdc_forward_n128_k3_d256_gemm_fp16_available_cuda(torch::Tensor h,
+                                                       torch::Tensor kc,
+                                                       torch::Tensor mix,
+                                                       int64_t off,
+                                                       int64_t dilation);
+
+torch::Tensor fdc_forward_n128_k3_d256_gemm_fp16_cuda(torch::Tensor h,
+                                                      torch::Tensor kc,
+                                                      torch::Tensor mix,
+                                                      int64_t off);
+
+// ======================================================================================
 // Backward basic plans
 // ======================================================================================
 
@@ -161,17 +224,6 @@ fdc_new_backward_gemm_nk3_d256_cuda(torch::Tensor go, torch::Tensor h,
                                     torch::Tensor kc, torch::Tensor mix,
                                     int64_t off);
 
-bool fdc_forward_n128_k3_d256_batched_sgemm_available_cuda(torch::Tensor h,
-                                                           torch::Tensor kc,
-                                                           torch::Tensor mix,
-                                                           int64_t off,
-                                                           int64_t dilation);
-
-torch::Tensor fdc_forward_n128_k3_d256_batched_sgemm_cuda(torch::Tensor h,
-                                                          torch::Tensor kc,
-                                                          torch::Tensor mix,
-                                                          int64_t off);
-
 bool fdc_backward_n16_k3_d256_gemm_available_cuda(
     torch::Tensor go, torch::Tensor h, torch::Tensor kc, torch::Tensor mix,
     int64_t off, int64_t dilation);
@@ -210,3 +262,43 @@ std::vector<torch::Tensor>
 fdc_backward_n128_k3_d256_gemm_cuda(torch::Tensor go, torch::Tensor h,
                                     torch::Tensor kc, torch::Tensor mix,
                                     int64_t off);
+
+// ======================================================================================
+// Backward fp16 Tensor Core GEMM plans
+// ======================================================================================
+
+bool fdc_backward_n16_k3_d256_gemm_fp16_available_cuda(
+    torch::Tensor go, torch::Tensor h, torch::Tensor kc, torch::Tensor mix,
+    int64_t off, int64_t dilation);
+
+std::vector<torch::Tensor>
+fdc_backward_n16_k3_d256_gemm_fp16_cuda(torch::Tensor go, torch::Tensor h,
+                                        torch::Tensor kc, torch::Tensor mix,
+                                        int64_t off);
+
+bool fdc_backward_n32_k3_d256_gemm_fp16_available_cuda(
+    torch::Tensor go, torch::Tensor h, torch::Tensor kc, torch::Tensor mix,
+    int64_t off, int64_t dilation);
+
+std::vector<torch::Tensor>
+fdc_backward_n32_k3_d256_gemm_fp16_cuda(torch::Tensor go, torch::Tensor h,
+                                        torch::Tensor kc, torch::Tensor mix,
+                                        int64_t off);
+
+bool fdc_backward_n64_k3_d256_gemm_fp16_available_cuda(
+    torch::Tensor go, torch::Tensor h, torch::Tensor kc, torch::Tensor mix,
+    int64_t off, int64_t dilation);
+
+std::vector<torch::Tensor>
+fdc_backward_n64_k3_d256_gemm_fp16_cuda(torch::Tensor go, torch::Tensor h,
+                                        torch::Tensor kc, torch::Tensor mix,
+                                        int64_t off);
+
+bool fdc_backward_n128_k3_d256_gemm_fp16_available_cuda(
+    torch::Tensor go, torch::Tensor h, torch::Tensor kc, torch::Tensor mix,
+    int64_t off, int64_t dilation);
+
+std::vector<torch::Tensor>
+fdc_backward_n128_k3_d256_gemm_fp16_cuda(torch::Tensor go, torch::Tensor h,
+                                         torch::Tensor kc, torch::Tensor mix,
+                                         int64_t off);

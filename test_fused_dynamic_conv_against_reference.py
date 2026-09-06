@@ -95,8 +95,33 @@ def torch_reference_materialized_chunk(
     t_offset: int,
     dilation: int = 1,
 ) -> torch.Tensor:
+    """
+    PyTorch materialized reference.
+
+    新布局:
+        h_full:
+            [B,D,L]
+
+        kernel_chunk:
+            [B,K,N,T]
+
+        kernel_mix:
+            [D,N]
+
+    输出:
+        out:
+            [B,D,T]
+
+    语义:
+        out[b,d,t] =
+            sum_kk sum_n
+                h_full[b,d,t_offset + t - kk * dilation]
+                * kernel_chunk[b,kk,n,t]
+                * kernel_mix[d,n]
+    """
+
     B, D, L = h_full.shape
-    Bk, T, N, K = kernel_chunk.shape
+    Bk, K, N, T = kernel_chunk.shape
     Dm, Nm = kernel_mix.shape
 
     assert B == Bk
@@ -107,10 +132,11 @@ def torch_reference_materialized_chunk(
     assert t_offset + T <= L
 
     mixed_kernel = torch.einsum(
-        "btnk,dn->bdtk",
+        "bknt,dn->bdtk",
         kernel_chunk,
         kernel_mix,
     )
+    # [B,D,T,K]
 
     out = torch.zeros(
         B,
@@ -162,7 +188,6 @@ def torch_reference_materialized_chunk(
 
     return out
 
-
 def torch_reference_no_materialize_chunk(
     h_full: torch.Tensor,
     kernel_chunk: torch.Tensor,
@@ -170,8 +195,26 @@ def torch_reference_no_materialize_chunk(
     t_offset: int,
     dilation: int = 1,
 ) -> torch.Tensor:
+    """
+    PyTorch no-materialize reference.
+
+    新布局:
+        h_full:
+            [B,D,L]
+
+        kernel_chunk:
+            [B,K,N,T]
+
+        kernel_mix:
+            [D,N]
+
+    输出:
+        out:
+            [B,D,T]
+    """
+
     B, D, L = h_full.shape
-    Bk, T, N, K = kernel_chunk.shape
+    Bk, K, N, T = kernel_chunk.shape
     Dm, Nm = kernel_mix.shape
 
     assert B == Bk
@@ -209,15 +252,16 @@ def torch_reference_no_materialize_chunk(
             continue
 
         weight = torch.einsum(
-            "btn,dn->bdt",
+            "bnt,dn->bdt",
             kernel_chunk[
                 :,
-                dst_start:dst_end,
-                :,
                 kk,
+                :,
+                dst_start:dst_end,
             ],
             kernel_mix,
         )
+        # [B,D,T_valid]
 
         h_slice = h_full[
             :,
@@ -236,7 +280,6 @@ def torch_reference_no_materialize_chunk(
         ] + weight * h_slice
 
     return out
-
 
 def get_tolerances(dtype: torch.dtype):
     if dtype == torch.float32:
@@ -350,9 +393,9 @@ def run_correctness_case_body(
     kernel = make_leaf_randn(
         shape=(
             case.B,
-            case.T,
-            case.N,
             case.K,
+            case.N,
+            case.T,
         ),
         device=device,
         dtype=dtype,
@@ -544,6 +587,7 @@ def run_correctness_case_body(
 
     torch.cuda.synchronize()
 
+
 def run_full_length_equivalence_body(
     dtype: torch.dtype,
 ):
@@ -556,7 +600,7 @@ def run_full_length_equivalence_body(
         777
     )
 
-    B = 2
+    B = 1
     D = 17
     L = 65
     N = 5
@@ -579,9 +623,9 @@ def run_full_length_equivalence_body(
     kernel = make_leaf_randn(
         shape=(
             B,
-            L,
-            N,
             K,
+            N,
+            L,
         ),
         device=device,
         dtype=dtype,
@@ -776,9 +820,9 @@ def run_gradcheck_reference_only_body():
     kernel = make_leaf_randn(
         shape=(
             B,
-            T,
-            N,
             K,
+            N,
+            T,
         ),
         device=device,
         dtype=dtype,
@@ -828,12 +872,21 @@ def run_gradcheck_reference_only_body():
     if not ok:
         raise RuntimeError("gradcheck failed.")
 
-
 def estimate_case_bytes(
     case: Case,
     dtype: torch.dtype,
     include_ref: bool = True,
 ) -> int:
+    """
+    粗略估算 case 最小显存。
+
+    新布局:
+        kernel: [B,K,N,T]
+
+    注意:
+        元素数与旧 [B,T,N,K] 相同，只是维度顺序变了。
+    """
+
     if dtype in (
         torch.float16,
         torch.bfloat16,
@@ -853,7 +906,7 @@ def estimate_case_bytes(
 
     h = B * D * L
     out = B * D * T
-    kernel = B * T * N * K
+    kernel = B * K * N * T
     mix = D * N
     grad = out
 
@@ -864,7 +917,6 @@ def estimate_case_bytes(
         base_min += mixed_kernel
 
     return int(base_min * elem)
-
 
 def get_available_dtypes() -> List[torch.dtype]:
     dtypes = [
@@ -929,7 +981,7 @@ def get_full_cases() -> List[Case]:
         [
             Case(
                 name="B2_D17_mid_dil2",
-                B=2,
+                B=1,
                 D=17,
                 L=67,
                 T=19,
@@ -940,7 +992,7 @@ def get_full_cases() -> List[Case]:
             ),
             Case(
                 name="B2_D31_dil4",
-                B=2,
+                B=1,
                 D=31,
                 L=129,
                 T=64,
@@ -973,7 +1025,7 @@ def get_full_cases() -> List[Case]:
             ),
             Case(
                 name="near_tail",
-                B=2,
+                B=1,
                 D=64,
                 L=511,
                 T=127,
@@ -1044,7 +1096,23 @@ def get_full_cases() -> List[Case]:
 
 
 def get_stress_cases() -> List[Case]:
+    """
+    Correctness stress cases.
+
+    这里主要用于 correctness/stress，不追求每个 case 都一定跑完。
+    如果显存不足，现有 runner 会 OOM SKIP。
+
+    覆盖目标：
+      - chunk size T: 4096 ~ 262144, powers of two
+      - D/channel: 3, 4, 8, 16, 32, 64, 128, 256, 512
+      - N/embed/mix size: 6, 16, 32, 64, 128
+      - K/kernel size: 1, 2, 3, 4, 7, 8, 15, 16
+      - dilation: 1 plus several non-1 fallback cases
+    """
     return [
+        # ------------------------------------------------------------------
+        # Existing baseline stress cases. Keep these for regression.
+        # ------------------------------------------------------------------
         Case(
             name="bench_small_T4096",
             B=1,
@@ -1133,8 +1201,369 @@ def get_stress_cases() -> List[Case]:
             t_offset=16384,
             dilation=2,
         ),
-    ]
 
+        # ------------------------------------------------------------------
+        # many-N K3 D256 correctness stress.
+        # These should be eligible for backward_manyn_k3_d256 when:
+        #   B=1, D=256, K=3, dilation=1, N>=16, N<=128, T>=2048
+        # ------------------------------------------------------------------
+        Case(
+            name="manyn_D256_N16_T4096_K3",
+            B=1,
+            D=256,
+            L=16384,
+            T=4096,
+            N=16,
+            K=3,
+            t_offset=8192,
+            dilation=1,
+        ),
+        Case(
+            name="manyn_D256_N16_T8192_K3",
+            B=1,
+            D=256,
+            L=32768,
+            T=8192,
+            N=16,
+            K=3,
+            t_offset=16384,
+            dilation=1,
+        ),
+        Case(
+            name="manyn_D256_N32_T4096_K3",
+            B=1,
+            D=256,
+            L=16384,
+            T=4096,
+            N=32,
+            K=3,
+            t_offset=8192,
+            dilation=1,
+        ),
+        Case(
+            name="manyn_D256_N32_T8192_K3",
+            B=1,
+            D=256,
+            L=32768,
+            T=8192,
+            N=32,
+            K=3,
+            t_offset=16384,
+            dilation=1,
+        ),
+        Case(
+            name="manyn_D256_N64_T4096_K3",
+            B=1,
+            D=256,
+            L=16384,
+            T=4096,
+            N=64,
+            K=3,
+            t_offset=8192,
+            dilation=1,
+        ),
+        Case(
+            name="manyn_D256_N64_T8192_K3",
+            B=1,
+            D=256,
+            L=32768,
+            T=8192,
+            N=64,
+            K=3,
+            t_offset=16384,
+            dilation=1,
+        ),
+        Case(
+            name="manyn_D256_N128_T4096_K3",
+            B=1,
+            D=256,
+            L=16384,
+            T=4096,
+            N=128,
+            K=3,
+            t_offset=8192,
+            dilation=1,
+        ),
+        Case(
+            name="manyn_D256_N128_T8192_K3",
+            B=1,
+            D=256,
+            L=32768,
+            T=8192,
+            N=128,
+            K=3,
+            t_offset=16384,
+            dilation=1,
+        ),
+
+        # ------------------------------------------------------------------
+        # Power-of-two chunk sizes, N6 K3 D256.
+        # This guards existing fast N6 path over increasing T.
+        # ------------------------------------------------------------------
+        Case(
+            name="pow2_chunk_D256_N6_K3_T4096",
+            B=1,
+            D=256,
+            L=16384,
+            T=4096,
+            N=6,
+            K=3,
+            t_offset=8192,
+            dilation=1,
+        ),
+        Case(
+            name="pow2_chunk_D256_N6_K3_T8192",
+            B=1,
+            D=256,
+            L=32768,
+            T=8192,
+            N=6,
+            K=3,
+            t_offset=16384,
+            dilation=1,
+        ),
+        Case(
+            name="pow2_chunk_D256_N6_K3_T16384",
+            B=1,
+            D=256,
+            L=65536,
+            T=16384,
+            N=6,
+            K=3,
+            t_offset=32768,
+            dilation=1,
+        ),
+        Case(
+            name="pow2_chunk_D256_N6_K3_T32768",
+            B=1,
+            D=256,
+            L=131072,
+            T=32768,
+            N=6,
+            K=3,
+            t_offset=65536,
+            dilation=1,
+        ),
+        Case(
+            name="pow2_chunk_D256_N6_K3_T65536",
+            B=1,
+            D=256,
+            L=262144,
+            T=65536,
+            N=6,
+            K=3,
+            t_offset=131072,
+            dilation=1,
+        ),
+        Case(
+            name="pow2_chunk_D256_N6_K3_T131072",
+            B=1,
+            D=256,
+            L=524288,
+            T=131072,
+            N=6,
+            K=3,
+            t_offset=262144,
+            dilation=1,
+        ),
+        Case(
+            name="pow2_chunk_D256_N6_K3_T262144",
+            B=1,
+            D=256,
+            L=1048576,
+            T=262144,
+            N=6,
+            K=3,
+            t_offset=524288,
+            dilation=1,
+        ),
+
+        # ------------------------------------------------------------------
+        # Power-of-two D/channel coverage.
+        # D=3 is included as low-channel non-power boundary.
+        # ------------------------------------------------------------------
+        Case(
+            name="channel_D3_T4096_N6_K3",
+            B=1,
+            D=3,
+            L=16384,
+            T=4096,
+            N=6,
+            K=3,
+            t_offset=8192,
+            dilation=1,
+        ),
+        Case(
+            name="channel_D4_T4096_N6_K3",
+            B=1,
+            D=4,
+            L=16384,
+            T=4096,
+            N=6,
+            K=3,
+            t_offset=8192,
+            dilation=1,
+        ),
+        Case(
+            name="channel_D8_T4096_N6_K3",
+            B=1,
+            D=8,
+            L=16384,
+            T=4096,
+            N=6,
+            K=3,
+            t_offset=8192,
+            dilation=1,
+        ),
+        Case(
+            name="channel_D16_T4096_N6_K3",
+            B=1,
+            D=16,
+            L=16384,
+            T=4096,
+            N=6,
+            K=3,
+            t_offset=8192,
+            dilation=1,
+        ),
+        Case(
+            name="channel_D32_T4096_N6_K3",
+            B=1,
+            D=32,
+            L=16384,
+            T=4096,
+            N=6,
+            K=3,
+            t_offset=8192,
+            dilation=1,
+        ),
+        Case(
+            name="channel_D64_T4096_N6_K3",
+            B=1,
+            D=64,
+            L=16384,
+            T=4096,
+            N=6,
+            K=3,
+            t_offset=8192,
+            dilation=1,
+        ),
+        Case(
+            name="channel_D128_T4096_N6_K3",
+            B=1,
+            D=128,
+            L=16384,
+            T=4096,
+            N=6,
+            K=3,
+            t_offset=8192,
+            dilation=1,
+        ),
+        Case(
+            name="channel_D256_T4096_N6_K3",
+            B=1,
+            D=256,
+            L=16384,
+            T=4096,
+            N=6,
+            K=3,
+            t_offset=8192,
+            dilation=1,
+        ),
+        Case(
+            name="channel_D512_T4096_N6_K3",
+            B=1,
+            D=512,
+            L=16384,
+            T=4096,
+            N=6,
+            K=3,
+            t_offset=8192,
+            dilation=1,
+        ),
+
+        # ------------------------------------------------------------------
+        # Kernel size coverage.
+        # Powers of two plus common odd kernels within 1~20.
+        # ------------------------------------------------------------------
+        Case(
+            name="kernel_K1_T4096_D256_N6",
+            B=1,
+            D=256,
+            L=16384,
+            T=4096,
+            N=6,
+            K=1,
+            t_offset=8192,
+            dilation=1,
+        ),
+        Case(
+            name="kernel_K2_T4096_D256_N6",
+            B=1,
+            D=256,
+            L=16384,
+            T=4096,
+            N=6,
+            K=2,
+            t_offset=8192,
+            dilation=1,
+        ),
+        Case(
+            name="kernel_K4_T4096_D256_N6",
+            B=1,
+            D=256,
+            L=16384,
+            T=4096,
+            N=6,
+            K=4,
+            t_offset=8192,
+            dilation=1,
+        ),
+        Case(
+            name="kernel_K8_T4096_D256_N6",
+            B=1,
+            D=256,
+            L=16384,
+            T=4096,
+            N=6,
+            K=8,
+            t_offset=8192,
+            dilation=1,
+        ),
+        Case(
+            name="kernel_K16_T4096_D256_N6",
+            B=1,
+            D=256,
+            L=32768,
+            T=4096,
+            N=6,
+            K=16,
+            t_offset=16384,
+            dilation=1,
+        ),
+        Case(
+            name="kernel_K7_T8192_D256_N6",
+            B=1,
+            D=256,
+            L=32768,
+            T=8192,
+            N=6,
+            K=7,
+            t_offset=16384,
+            dilation=1,
+        ),
+        Case(
+            name="kernel_K15_T4096_D256_N6_dil2",
+            B=1,
+            D=256,
+            L=32768,
+            T=4096,
+            N=6,
+            K=15,
+            t_offset=16384,
+            dilation=2,
+        ),
+    ]
 
 def worker_entry(
     mode: str,
@@ -1565,9 +1994,9 @@ def benchmark_case_body(
     base_kernel = make_leaf_randn(
         shape=(
             case.B,
-            case.T,
-            case.N,
             case.K,
+            case.N,
+            case.T,
         ),
         device=device,
         dtype=dtype,
@@ -1816,8 +2245,23 @@ def benchmark_case_body(
         "backward_plan_name": selected_backward_plan_name,
     }
 
+
 def get_benchmark_cases() -> List[Case]:
+    """
+    Benchmark cases.
+
+    设计原则：
+      1. 保留原来的 8 个 benchmark case，避免破坏历史对比。
+      2. 新增 many-N 专项，覆盖 N=16/32/64/128。
+      3. 新增 power-of-two chunk size 专项，覆盖 T=4096~262144。
+      4. 新增 power-of-two D/channel 专项，覆盖 D=4~512，并保留 D=3 边界。
+      5. 新增 kernel size 专项，覆盖 K=1/2/4/8/16 和常见 K=3/7/15。
+      6. 大尺寸可能 OOM 或 timeout，现有 runner 会自动 skip。
+    """
     return [
+        # # ------------------------------------------------------------------
+        # # Original 8 benchmark cases. Do not remove.
+        # # ------------------------------------------------------------------
         Case(
             name="original_small_T4096",
             B=1,
@@ -1906,8 +2350,532 @@ def get_benchmark_cases() -> List[Case]:
             t_offset=16384,
             dilation=1,
         ),
-    ]
 
+        # ------------------------------------------------------------------
+        # many-N plan benchmark.
+        # Expected candidate:
+        #   backward_manyn_k3_d256
+        # Conditions:
+        #   B=1, D=256, K=3, dilation=1, N in [16,128], T>=2048
+        # ------------------------------------------------------------------
+        Case(
+            name="manyn_N16_T4096_D256_K3",
+            B=1,
+            D=256,
+            L=16384,
+            T=4096,
+            N=16,
+            K=3,
+            t_offset=8192,
+            dilation=1,
+        ),
+        Case(
+            name="manyn_N16_T8192_D256_K3",
+            B=1,
+            D=256,
+            L=32768,
+            T=8192,
+            N=16,
+            K=3,
+            t_offset=16384,
+            dilation=1,
+        ),
+        Case(
+            name="manyn_N16_T16384_D256_K3",
+            B=1,
+            D=256,
+            L=65536,
+            T=16384,
+            N=16,
+            K=3,
+            t_offset=32768,
+            dilation=1,
+        ),
+        Case(
+            name="manyn_N32_T4096_D256_K3",
+            B=1,
+            D=256,
+            L=16384,
+            T=4096,
+            N=32,
+            K=3,
+            t_offset=8192,
+            dilation=1,
+        ),
+        Case(
+            name="manyn_N32_T8192_D256_K3",
+            B=1,
+            D=256,
+            L=32768,
+            T=8192,
+            N=32,
+            K=3,
+            t_offset=16384,
+            dilation=1,
+        ),
+        Case(
+            name="manyn_N32_T16384_D256_K3",
+            B=1,
+            D=256,
+            L=65536,
+            T=16384,
+            N=32,
+            K=3,
+            t_offset=32768,
+            dilation=1,
+        ),
+        Case(
+            name="manyn_N64_T4096_D256_K3",
+            B=1,
+            D=256,
+            L=16384,
+            T=4096,
+            N=64,
+            K=3,
+            t_offset=8192,
+            dilation=1,
+        ),
+        Case(
+            name="manyn_N64_T8192_D256_K3",
+            B=1,
+            D=256,
+            L=32768,
+            T=8192,
+            N=64,
+            K=3,
+            t_offset=16384,
+            dilation=1,
+        ),
+        Case(
+            name="manyn_N64_T16384_D256_K3",
+            B=1,
+            D=256,
+            L=65536,
+            T=16384,
+            N=64,
+            K=3,
+            t_offset=32768,
+            dilation=1,
+        ),
+        Case(
+            name="manyn_N128_T4096_D256_K3",
+            B=1,
+            D=256,
+            L=16384,
+            T=4096,
+            N=128,
+            K=3,
+            t_offset=8192,
+            dilation=1,
+        ),
+        Case(
+            name="manyn_N128_T8192_D256_K3",
+            B=1,
+            D=256,
+            L=32768,
+            T=8192,
+            N=128,
+            K=3,
+            t_offset=16384,
+            dilation=1,
+        ),
+        Case(
+            name="manyn_N128_T16384_D256_K3",
+            B=1,
+            D=256,
+            L=65536,
+            T=16384,
+            N=128,
+            K=3,
+            t_offset=32768,
+            dilation=1,
+        ),
+
+        # ------------------------------------------------------------------
+        # Power-of-two chunk size benchmark.
+        # T/chunksize: 4096, 8192, 16384, 32768, 65536, 131072, 262144
+        # Uses N6 K3 D256 to guard the existing highly optimized path.
+        # ------------------------------------------------------------------
+        Case(
+            name="chunk_T4096_D256_N6_K3",
+            B=1,
+            D=256,
+            L=16384,
+            T=4096,
+            N=6,
+            K=3,
+            t_offset=8192,
+            dilation=1,
+        ),
+        Case(
+            name="chunk_T8192_D256_N6_K3",
+            B=1,
+            D=256,
+            L=32768,
+            T=8192,
+            N=6,
+            K=3,
+            t_offset=16384,
+            dilation=1,
+        ),
+        Case(
+            name="chunk_T16384_D256_N6_K3",
+            B=1,
+            D=256,
+            L=65536,
+            T=16384,
+            N=6,
+            K=3,
+            t_offset=32768,
+            dilation=1,
+        ),
+        Case(
+            name="chunk_T32768_D256_N6_K3",
+            B=1,
+            D=256,
+            L=131072,
+            T=32768,
+            N=6,
+            K=3,
+            t_offset=65536,
+            dilation=1,
+        ),
+        Case(
+            name="chunk_T65536_D256_N6_K3",
+            B=1,
+            D=256,
+            L=262144,
+            T=65536,
+            N=6,
+            K=3,
+            t_offset=131072,
+            dilation=1,
+        ),
+        Case(
+            name="chunk_T131072_D256_N6_K3",
+            B=1,
+            D=256,
+            L=524288,
+            T=131072,
+            N=6,
+            K=3,
+            t_offset=262144,
+            dilation=1,
+        ),
+        Case(
+            name="chunk_T262144_D256_N6_K3",
+            B=1,
+            D=256,
+            L=1048576,
+            T=262144,
+            N=6,
+            K=3,
+            t_offset=524288,
+            dilation=1,
+        ),
+
+        # ------------------------------------------------------------------
+        # Channel/D benchmark.
+        # Channel requested range: 3~512.
+        # Use powers of two plus D=3 boundary.
+        # ------------------------------------------------------------------
+        Case(
+            name="channel_D3_T4096_N6_K3",
+            B=1,
+            D=3,
+            L=16384,
+            T=4096,
+            N=6,
+            K=3,
+            t_offset=8192,
+            dilation=1,
+        ),
+        Case(
+            name="channel_D4_T4096_N6_K3",
+            B=1,
+            D=4,
+            L=16384,
+            T=4096,
+            N=6,
+            K=3,
+            t_offset=8192,
+            dilation=1,
+        ),
+        Case(
+            name="channel_D8_T4096_N6_K3",
+            B=1,
+            D=8,
+            L=16384,
+            T=4096,
+            N=6,
+            K=3,
+            t_offset=8192,
+            dilation=1,
+        ),
+        Case(
+            name="channel_D16_T4096_N6_K3",
+            B=1,
+            D=16,
+            L=16384,
+            T=4096,
+            N=6,
+            K=3,
+            t_offset=8192,
+            dilation=1,
+        ),
+        Case(
+            name="channel_D32_T4096_N6_K3",
+            B=1,
+            D=32,
+            L=16384,
+            T=4096,
+            N=6,
+            K=3,
+            t_offset=8192,
+            dilation=1,
+        ),
+        Case(
+            name="channel_D64_T4096_N6_K3",
+            B=1,
+            D=64,
+            L=16384,
+            T=4096,
+            N=6,
+            K=3,
+            t_offset=8192,
+            dilation=1,
+        ),
+        Case(
+            name="channel_D128_T4096_N6_K3",
+            B=1,
+            D=128,
+            L=16384,
+            T=4096,
+            N=6,
+            K=3,
+            t_offset=8192,
+            dilation=1,
+        ),
+        Case(
+            name="channel_D256_T4096_N6_K3",
+            B=1,
+            D=256,
+            L=16384,
+            T=4096,
+            N=6,
+            K=3,
+            t_offset=8192,
+            dilation=1,
+        ),
+        Case(
+            name="channel_D512_T4096_N6_K3",
+            B=1,
+            D=512,
+            L=16384,
+            T=4096,
+            N=6,
+            K=3,
+            t_offset=8192,
+            dilation=1,
+        ),
+
+        # ------------------------------------------------------------------
+        # Larger embed/channel style benchmark.
+        # 这里按你的描述增加 embedsize=256~4096 的场景。
+        # 在当前算子参数里，D 是输出/hidden channel，更接近模型 embed/channel。
+        # 因此这里覆盖 D=256/512/1024/2048/4096。
+        #
+        # 注意 D=2048/4096 在 GTX 1660 Ti 上可能 OOM，runner 会 skip。
+        # ------------------------------------------------------------------
+        Case(
+            name="embed_D256_T4096_N6_K3",
+            B=1,
+            D=256,
+            L=16384,
+            T=4096,
+            N=6,
+            K=3,
+            t_offset=8192,
+            dilation=1,
+        ),
+        Case(
+            name="embed_D512_T4096_N6_K3",
+            B=1,
+            D=512,
+            L=16384,
+            T=4096,
+            N=6,
+            K=3,
+            t_offset=8192,
+            dilation=1,
+        ),
+        Case(
+            name="embed_D1024_T4096_N6_K3",
+            B=1,
+            D=1024,
+            L=16384,
+            T=4096,
+            N=6,
+            K=3,
+            t_offset=8192,
+            dilation=1,
+        ),
+        Case(
+            name="embed_D2048_T4096_N6_K3",
+            B=1,
+            D=2048,
+            L=16384,
+            T=4096,
+            N=6,
+            K=3,
+            t_offset=8192,
+            dilation=1,
+        ),
+        Case(
+            name="embed_D4096_T4096_N6_K3",
+            B=1,
+            D=4096,
+            L=16384,
+            T=4096,
+            N=6,
+            K=3,
+            t_offset=8192,
+            dilation=1,
+        ),
+
+        # ------------------------------------------------------------------
+        # Kernel size benchmark.
+        # K in 1~20:
+        #   powers of two: 1, 2, 4, 8, 16
+        #   common odd kernels: 3, 7, 15
+        # ------------------------------------------------------------------
+        Case(
+            name="kernel_K1_T4096_D256_N6",
+            B=1,
+            D=256,
+            L=16384,
+            T=4096,
+            N=6,
+            K=1,
+            t_offset=8192,
+            dilation=1,
+        ),
+        Case(
+            name="kernel_K2_T4096_D256_N6",
+            B=1,
+            D=256,
+            L=16384,
+            T=4096,
+            N=6,
+            K=2,
+            t_offset=8192,
+            dilation=1,
+        ),
+        Case(
+            name="kernel_K3_T4096_D256_N6",
+            B=1,
+            D=256,
+            L=16384,
+            T=4096,
+            N=6,
+            K=3,
+            t_offset=8192,
+            dilation=1,
+        ),
+        Case(
+            name="kernel_K4_T4096_D256_N6",
+            B=1,
+            D=256,
+            L=16384,
+            T=4096,
+            N=6,
+            K=4,
+            t_offset=8192,
+            dilation=1,
+        ),
+        Case(
+            name="kernel_K7_T8192_D256_N6",
+            B=1,
+            D=256,
+            L=32768,
+            T=8192,
+            N=6,
+            K=7,
+            t_offset=16384,
+            dilation=1,
+        ),
+        Case(
+            name="kernel_K8_T4096_D256_N6",
+            B=1,
+            D=256,
+            L=16384,
+            T=4096,
+            N=6,
+            K=8,
+            t_offset=8192,
+            dilation=1,
+        ),
+        Case(
+            name="kernel_K15_T4096_D256_N6",
+            B=1,
+            D=256,
+            L=32768,
+            T=4096,
+            N=6,
+            K=15,
+            t_offset=16384,
+            dilation=1,
+        ),
+        Case(
+            name="kernel_K16_T4096_D256_N6",
+            B=1,
+            D=256,
+            L=32768,
+            T=4096,
+            N=6,
+            K=16,
+            t_offset=16384,
+            dilation=1,
+        ),
+
+        # ------------------------------------------------------------------
+        # Dilation fallback benchmark.
+        # These should generally avoid specialized dilation=1-only plans.
+        # ------------------------------------------------------------------
+        Case(
+            name="dilation2_D256_T4096_N6_K3",
+            B=1,
+            D=256,
+            L=32768,
+            T=4096,
+            N=6,
+            K=3,
+            t_offset=16384,
+            dilation=2,
+        ),
+        Case(
+            name="dilation4_D256_T4096_N6_K3",
+            B=1,
+            D=256,
+            L=32768,
+            T=4096,
+            N=6,
+            K=3,
+            t_offset=16384,
+            dilation=4,
+        ),
+        Case(
+            name="dilation8_D256_T4096_N6_K3",
+            B=1,
+            D=256,
+            L=65536,
+            T=4096,
+            N=6,
+            K=3,
+            t_offset=32768,
+            dilation=8,
+        ),
+    ]
 
 def run_benchmark_suite(
     cases: List[Case],

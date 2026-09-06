@@ -23,28 +23,40 @@ enum class FDCBackwardPlan : int {
     Large = 4,
     ManyNK3D256 = 7,
 
-    // 新增 backward GEMM 化特化方案。
+    // fp32 backward GEMM specialized plans.
     //
-    // 这些方案不替换现有 ManyNK3D256 / Large / MidN6K3Warp。
-    // 只作为额外 candidate 参与 warmup。
-    //
-    // 目标 shape:
+    // Target:
     //   B == 1
     //   D == 256
     //   K == 3
     //   dilation == 1
     //   dtype == float32
     //   N == 16 / 32 / 64 / 128
-    //
-    // 核心:
-    //   make G[3,D,T]
-    //   grad_kernel: 3x SGEMM
-    //   grad_mix:    3x SGEMM
-    //   grad_h:      direct CUDA kernel
     N16K3D256Gemm = 16,
     N32K3D256Gemm = 32,
     N64K3D256Gemm = 64,
-    N128K3D256Gemm = 128
+    N128K3D256Gemm = 128,
+
+    // fp16 backward GEMM specialized plans.
+    //
+    // Target:
+    //   B == 1
+    //   D == 256
+    //   K == 3
+    //   dilation == 1
+    //   dtype == float16
+    //   N == 16 / 32 / 64 / 128
+    //
+    // Implementation:
+    //   make G[3,D,T] half
+    //   grad_kernel: cublasGemmStridedBatchedEx
+    //   grad_mix:    cublasGemmStridedBatchedEx + reduce
+    //   grad_h:      W = mix @ kc by cublasGemmStridedBatchedEx
+    //                then no-atomic gather kernel
+    N16K3D256GemmFp16 = 1016,
+    N32K3D256GemmFp16 = 1032,
+    N64K3D256GemmFp16 = 1064,
+    N128K3D256GemmFp16 = 1128
 };
 
 static inline const char* fdc_backward_plan_name_impl(FDCBackwardPlan p) {
@@ -69,6 +81,18 @@ static inline const char* fdc_backward_plan_name_impl(FDCBackwardPlan p) {
 
         case FDCBackwardPlan::N128K3D256Gemm:
             return "backward_n128_k3_d256_gemm";
+
+        case FDCBackwardPlan::N16K3D256GemmFp16:
+            return "backward_n16_k3_d256_gemm_fp16";
+
+        case FDCBackwardPlan::N32K3D256GemmFp16:
+            return "backward_n32_k3_d256_gemm_fp16";
+
+        case FDCBackwardPlan::N64K3D256GemmFp16:
+            return "backward_n64_k3_d256_gemm_fp16";
+
+        case FDCBackwardPlan::N128K3D256GemmFp16:
+            return "backward_n128_k3_d256_gemm_fp16";
 
         default:
             return "unknown";
@@ -244,6 +268,11 @@ struct FDCShapeInfo {
     bool shape_n64_k3_d256_gemm;
     bool shape_n128_k3_d256_gemm;
 
+    bool shape_n16_k3_d256_gemm_fp16;
+    bool shape_n32_k3_d256_gemm_fp16;
+    bool shape_n64_k3_d256_gemm_fp16;
+    bool shape_n128_k3_d256_gemm_fp16;
+
     bool full4096_offset0_n6;
 };
 
@@ -291,14 +320,7 @@ static inline FDCShapeInfo make_fdc_shape_info(
         s.N <= 128 &&
         s.T >= 2048;
 
-    // 新增 GEMM backward 特化 shape。
-    //
-    // 注意:
-    //   当前 GEMM backward 实现只支持 fp32。
-    //   fp16/bf16 继续走现有 ManyNK3D256 或 Large 等方案。
-    //
-    // T 阈值设置为 >= 512，和 forward many-N 特化类似。
-    // 如果后续 benchmark 发现小 T 不划算，可以提高到 2048。
+    // fp32 GEMM backward shape flags.
     s.shape_n16_k3_d256_gemm =
         s.base_d256_k3_dil1 &&
         s.N == 16 &&
@@ -322,6 +344,35 @@ static inline FDCShapeInfo make_fdc_shape_info(
         s.N == 128 &&
         s.is_fp32 &&
         s.T >= 512;
+
+    // fp16 GEMM backward shape flags.
+    //
+    // T >= 1024:
+    //   避免很小 T 下 GemmEx launch + 临时 G/W/gm_tmp 不划算。
+    //   具体选择仍然交给 warmup。
+    s.shape_n16_k3_d256_gemm_fp16 =
+        s.base_d256_k3_dil1 &&
+        s.N == 16 &&
+        s.is_fp16 &&
+        s.T >= 1024;
+
+    s.shape_n32_k3_d256_gemm_fp16 =
+        s.base_d256_k3_dil1 &&
+        s.N == 32 &&
+        s.is_fp16 &&
+        s.T >= 1024;
+
+    s.shape_n64_k3_d256_gemm_fp16 =
+        s.base_d256_k3_dil1 &&
+        s.N == 64 &&
+        s.is_fp16 &&
+        s.T >= 1024;
+
+    s.shape_n128_k3_d256_gemm_fp16 =
+        s.base_d256_k3_dil1 &&
+        s.N == 128 &&
+        s.is_fp16 &&
+        s.T >= 1024;
 
     s.full4096_offset0_n6 =
         s.shape_n6 &&
@@ -472,6 +523,50 @@ static inline bool fdc_plan_available(
                        dilation
                    );
 
+        case FDCBackwardPlan::N16K3D256GemmFp16:
+            return s.shape_n16_k3_d256_gemm_fp16 &&
+                   fdc_backward_n16_k3_d256_gemm_fp16_available_cuda(
+                       go,
+                       h,
+                       kc,
+                       mix,
+                       off,
+                       dilation
+                   );
+
+        case FDCBackwardPlan::N32K3D256GemmFp16:
+            return s.shape_n32_k3_d256_gemm_fp16 &&
+                   fdc_backward_n32_k3_d256_gemm_fp16_available_cuda(
+                       go,
+                       h,
+                       kc,
+                       mix,
+                       off,
+                       dilation
+                   );
+
+        case FDCBackwardPlan::N64K3D256GemmFp16:
+            return s.shape_n64_k3_d256_gemm_fp16 &&
+                   fdc_backward_n64_k3_d256_gemm_fp16_available_cuda(
+                       go,
+                       h,
+                       kc,
+                       mix,
+                       off,
+                       dilation
+                   );
+
+        case FDCBackwardPlan::N128K3D256GemmFp16:
+            return s.shape_n128_k3_d256_gemm_fp16 &&
+                   fdc_backward_n128_k3_d256_gemm_fp16_available_cuda(
+                       go,
+                       h,
+                       kc,
+                       mix,
+                       off,
+                       dilation
+                   );
+
         case FDCBackwardPlan::Large:
             return s.is_fp32 || s.is_fp16 || s.is_bf16;
 
@@ -556,6 +651,42 @@ static std::vector<torch::Tensor> fdc_run_backward_plan(
                 off
             );
 
+        case FDCBackwardPlan::N16K3D256GemmFp16:
+            return fdc_backward_n16_k3_d256_gemm_fp16_cuda(
+                go,
+                h,
+                kc,
+                mix,
+                off
+            );
+
+        case FDCBackwardPlan::N32K3D256GemmFp16:
+            return fdc_backward_n32_k3_d256_gemm_fp16_cuda(
+                go,
+                h,
+                kc,
+                mix,
+                off
+            );
+
+        case FDCBackwardPlan::N64K3D256GemmFp16:
+            return fdc_backward_n64_k3_d256_gemm_fp16_cuda(
+                go,
+                h,
+                kc,
+                mix,
+                off
+            );
+
+        case FDCBackwardPlan::N128K3D256GemmFp16:
+            return fdc_backward_n128_k3_d256_gemm_fp16_cuda(
+                go,
+                h,
+                kc,
+                mix,
+                off
+            );
+
         case FDCBackwardPlan::Large:
             return fdc_backward_large_cuda(
                 go,
@@ -590,12 +721,13 @@ static FDCBackwardPlan fdc_default_backward_plan(
     );
 
     // 注意:
-    //   为了“不改变现有方案”，这里不默认选择新增 GEMM backward plan。
-    //   新增 GEMM backward plan 只进入 warmup candidate list。
+    //   为了不改变未 warmup 时的原有行为，
+    //   fp32/fp16 新 GEMM backward plan 均不放入 default heuristic。
+    //   它们只通过 warmup candidate 实测进入 cache。
     //
     // 因此:
-    //   - 未 warmup 时，行为与原逻辑保持一致。
-    //   - warmup 后，candidate 实测谁快选谁，并写入 cache。
+    //   - 未 warmup: 走原逻辑。
+    //   - warmup 后: candidate 谁快选谁。
 
     if (s.shape_n6_d512) {
         return FDCBackwardPlan::MidN6K3Warp;
@@ -617,9 +749,9 @@ static FDCBackwardPlan fdc_default_backward_plan(
         return FDCBackwardPlan::MidN6K3Warp;
     }
 
-    return FDCBackwardPlan::Large;
-
     (void)mix;
+
+    return FDCBackwardPlan::Large;
 }
 
 // ======================================================================================
@@ -637,14 +769,17 @@ static std::vector<FDCBackwardPlan> fdc_all_candidate_backward_plans(
     std::vector<FDCBackwardPlan> plans;
 
     FDCBackwardPlan all[] = {
-        // 新增 GEMM backward 特化方案。
+        // fp16 Tensor Core GEMM backward plans.
         //
-        // 放在 ManyNK3D256 前面只是影响 warmup 测试顺序，
-        // 不表示默认强制选择。
-        //
-        // warmup 会逐个计时:
-        //   ms < best_ms
-        // 谁快最终 cache 谁。
+        // 这些只在 dtype=float16 且 N=16/32/64/128,D=256,K=3,dilation=1 时 available。
+        // 放在前面只影响 warmup 测试顺序。
+        // 最终仍然由 median_ms 谁快选谁。
+        FDCBackwardPlan::N16K3D256GemmFp16,
+        FDCBackwardPlan::N32K3D256GemmFp16,
+        FDCBackwardPlan::N64K3D256GemmFp16,
+        FDCBackwardPlan::N128K3D256GemmFp16,
+
+        // fp32 GEMM backward plans.
         FDCBackwardPlan::N16K3D256Gemm,
         FDCBackwardPlan::N32K3D256Gemm,
         FDCBackwardPlan::N64K3D256Gemm,
